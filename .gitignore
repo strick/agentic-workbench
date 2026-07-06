@@ -1,0 +1,25 @@
+# Local config — machine-specific, never commit
+.env.local
+.env.*.local
+/local-config.json
+
+# Local data, runs, artifacts — never commit notes or generated output
+/data/
+/runs/
+/artifacts/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Keep examples in the repo
+!/examples/

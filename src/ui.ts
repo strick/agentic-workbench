@@ -1,0 +1,480 @@
+// Server-rendered HTML UI. No frontend framework: template literals + small
+// inline scripts that call the JSON API.
+import path from 'node:path';
+import { APP_ROOT, type LoadedConfig } from './config.ts';
+import type { PathCheck } from './paths.ts';
+import type { Skill } from './skills.ts';
+import type { ProviderHealth } from './providers/index.ts';
+import type { ArtifactRecord, RunRecord } from './store.ts';
+import type { DailyLogFile } from './workflows.ts';
+
+export function esc(s: unknown): string {
+  return String(s ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+const CSS = `
+:root{--bg:#10141a;--panel:#171d26;--panel2:#1e2633;--line:#2a3547;--text:#dbe4f0;--dim:#8899ad;
+--accent:#5eadf2;--ok:#4cc38a;--warn:#e5b567;--err:#e5726f;--mono:ui-monospace,Consolas,monospace}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
+font:15px/1.5 system-ui,'Segoe UI',sans-serif}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+header{display:flex;align-items:center;gap:18px;padding:10px 22px;background:var(--panel);
+border-bottom:1px solid var(--line);flex-wrap:wrap}
+header .logo{font-weight:700;letter-spacing:.4px}
+header nav{display:flex;gap:4px;flex-wrap:wrap}
+header nav a{padding:5px 11px;border-radius:7px;color:var(--dim)}
+header nav a.active,header nav a:hover{background:var(--panel2);color:var(--text);text-decoration:none}
+main{max-width:1060px;margin:0 auto;padding:22px}
+h1{font-size:21px;margin:.2em 0 .7em}h2{font-size:16px;margin:1.4em 0 .5em;color:var(--dim);
+text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{color:var(--dim);text-align:left;font-weight:600;padding:6px 10px;border-bottom:1px solid var(--line)}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.b-ok{background:#173527;color:var(--ok)}.b-warn{background:#3a2f16;color:var(--warn)}
+.b-err{background:#3a1d1c;color:var(--err)}.b-dim{background:var(--panel2);color:var(--dim)}
+.b-info{background:#16293a;color:var(--accent)}
+code,.mono{font-family:var(--mono);font-size:13px}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;
+overflow:auto;font-size:13px;white-space:pre-wrap}
+input[type=text],input[type=date],select,textarea{width:100%;background:var(--panel2);color:var(--text);
+border:1px solid var(--line);border-radius:7px;padding:8px 10px;font:inherit}
+textarea{font-family:var(--mono);font-size:13px;min-height:180px}
+label{display:block;margin:12px 0 4px;color:var(--dim);font-size:13px;font-weight:600}
+button{background:var(--accent);color:#0b1520;border:none;border-radius:7px;padding:8px 16px;
+font:inherit;font-weight:600;cursor:pointer}
+button.secondary{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:14px;flex-wrap:wrap}.row>*{flex:1;min-width:260px}
+.actions{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}
+.msg{margin:12px 0;padding:10px 14px;border-radius:8px;display:none}
+.msg.ok{display:block;background:#173527;color:var(--ok)}
+.msg.err{display:block;background:#3a1d1c;color:var(--err)}
+.dim{color:var(--dim)}.small{font-size:13px}
+.qa{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.qa a{display:block;background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+padding:14px;color:var(--text);font-weight:600}
+.qa a:hover{border-color:var(--accent);text-decoration:none}
+.qa a span{display:block;font-weight:400;color:var(--dim);font-size:13px;margin-top:4px}
+details summary{cursor:pointer;color:var(--accent)}
+`;
+
+const NAV = [
+  ['/', 'Dashboard'],
+  ['/settings', 'Settings'],
+  ['/skills', 'Skills'],
+  ['/inbox', 'Inbox'],
+  ['/weekly', 'Weekly Report'],
+  ['/wiki', 'Wiki Source'],
+  ['/runs', 'Runs'],
+  ['/artifacts', 'Artifacts'],
+] as const;
+
+export function layout(title: string, active: string, content: string): string {
+  const nav = NAV.map(([href, label]) => `<a href="${href}"${href === active ? ' class="active"' : ''}>${label}</a>`).join('');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)} — Agentic Workbench</title><style>${CSS}</style></head>
+<body><header><div class="logo">🛠 Agentic Workbench</div><nav>${nav}</nav></header>
+<main>${content}</main>
+<script>
+async function api(url,opts){const r=await fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opts));
+const j=await r.json().catch(()=>({error:'Bad response'}));if(!r.ok||j.error)throw new Error(j.error||r.statusText);return j}
+function msg(id,text,ok){const el=document.getElementById(id);if(!el)return;el.textContent='';
+el.className='msg '+(ok?'ok':'err');el.append(text||'');if(typeof arguments[3]==='object'&&arguments[3]){el.append(' ');el.append(arguments[3])}}
+</script></body></html>`;
+}
+
+function statusBadge(status: string): string {
+  const map: Record<string, string> = {
+    writable: 'b-ok', 'read-only': 'b-warn', missing: 'b-err', unreadable: 'b-err',
+    'not-configured': 'b-dim', completed: 'b-ok', running: 'b-info', error: 'b-err',
+  };
+  return `<span class="badge ${map[status] ?? 'b-dim'}">${esc(status)}</span>`;
+}
+
+function pathsTable(paths: PathCheck[]): string {
+  const rows = paths
+    .map(
+      (p) => `<tr><td>${esc(p.label)}</td>
+<td class="mono small">${esc(p.resolved || '—')}</td>
+<td>${statusBadge(p.status)}</td>
+<td class="dim small">${esc(p.note || '')}${p.fallback ? `<br>fallback: <span class="mono">${esc(p.fallback)}</span>` : ''}</td></tr>`,
+    )
+    .join('');
+  return `<table><tr><th>Path</th><th>Resolved</th><th>Status</th><th>Notes</th></tr>${rows}</table>`;
+}
+
+function providerRows(health: Array<{ id: string; name: string; capabilities: string[] } & ProviderHealth>): string {
+  return health
+    .map(
+      (h) => `<tr><td><b>${esc(h.name)}</b><br><span class="mono small dim">${esc(h.id)}</span></td>
+<td>${h.healthy ? '<span class="badge b-ok">available</span>' : '<span class="badge b-warn">unavailable</span>'}</td>
+<td class="small dim">${esc(h.detail)}</td></tr>`,
+    )
+    .join('');
+}
+
+function skillOptions(skills: Skill[], preferKind: string, selectedId?: string): string {
+  const sorted = [...skills].sort((a, b) => Number(b.kind === preferKind) - Number(a.kind === preferKind));
+  return sorted
+    .map((s) => {
+      const sel = selectedId ? s.id === selectedId : s === sorted[0];
+      return `<option value="${esc(s.id)}"${sel ? ' selected' : ''}>${esc(s.name)} ${s.source === 'examples' ? '(example)' : ''} — ${esc(s.kind)}</option>`;
+    })
+    .join('');
+}
+
+function providerOptions(defaultProvider: string): string {
+  return ['mock', 'claude-cli', 'copilot-cli']
+    .map((p) => `<option value="${p}"${p === defaultProvider ? ' selected' : ''}>${p}</option>`)
+    .join('');
+}
+
+// Per-run provider options: model override passed straight to the CLI (--model).
+const MODEL_FIELD = `<div><label for="modelInp">Model <span class="dim">(optional, CLI providers only)</span></label>
+<input type="text" id="modelInp" placeholder="e.g. claude-sonnet-5 — blank = provider default" spellcheck="false"></div>`;
+const MODEL_JS = `function modelVal(){return document.getElementById('modelInp').value.trim()}`;
+
+function runRows(runs: RunRecord[]): string {
+  if (!runs.length) return '<tr><td colspan="6" class="dim">No runs yet.</td></tr>';
+  return runs
+    .map(
+      (r) => `<tr><td><a href="/run?id=${esc(r.id)}" class="mono">${esc(r.id.slice(0, 8))}</a></td>
+<td>${esc(r.artifact_type)}</td><td>${esc(r.skill_name)}</td><td class="mono small">${esc(r.provider_id)}</td>
+<td>${statusBadge(r.status)}</td><td class="small dim">${esc(r.created_at.slice(0, 19).replace('T', ' '))}</td></tr>`,
+    )
+    .join('');
+}
+
+// --- Pages -------------------------------------------------------------------
+
+export function pageDashboard(d: {
+  needsSetup: boolean;
+  paths: PathCheck[];
+  providers: Array<{ id: string; name: string; capabilities: string[] } & ProviderHealth>;
+  runs: RunRecord[];
+  artifacts: ArtifactRecord[];
+  skillCount: number;
+  storeBackend: string;
+}): string {
+  const setupBanner = d.needsSetup
+    ? `<div class="panel" style="border-color:var(--warn)"><b>⚙ First-run setup:</b> no real note folders are configured yet —
+       everything currently falls back to the local <span class="mono">/data</span> folder (which works fine for trying it out).
+       <a href="/settings">Open Settings</a> to point the workbench at your <span class="mono">.copilot/skills</span> folder and Obsidian vault.</div>`
+    : '';
+  const artifacts = d.artifacts.length
+    ? d.artifacts
+        .map(
+          (a) => `<tr><td>${esc(a.title)}</td><td>${esc(a.type)}</td>
+<td class="small dim mono">${esc(a.path)}</td><td><a href="/artifacts?preview=${encodeURIComponent(a.path)}">preview</a></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="4" class="dim">No artifacts yet.</td></tr>';
+  return layout('Dashboard', '/', `
+<h1>Dashboard</h1>
+${setupBanner}
+<h2>Quick actions</h2>
+<div class="qa">
+  <a href="/inbox">📝 New Daily Log<span>Paste dictated notes, run a skill</span></a>
+  <a href="/weekly">📊 Generate Weekly Report<span>Synthesize a week of daily logs</span></a>
+  <a href="/wiki">📚 Generate Wiki Source<span>Sanitized canon source notes</span></a>
+</div>
+<h2>Configured paths</h2>
+<div class="panel">${pathsTable(d.paths)}
+<p class="small dim">Skills loaded: <b>${d.skillCount}</b> · Metadata store: <b>${esc(d.storeBackend)}</b></p></div>
+<h2>Providers</h2>
+<div class="panel"><table><tr><th>Provider</th><th>Health</th><th>Detail</th></tr>${providerRows(d.providers)}</table></div>
+<h2>Recent runs</h2>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Status</th><th>Created</th></tr>
+${runRows(d.runs)}</table></div>
+<h2>Latest artifacts</h2>
+<div class="panel"><table><tr><th>File</th><th>Type</th><th>Path</th><th></th></tr>${artifacts}</table></div>`);
+}
+
+export function pageSettings(d: {
+  cfg: LoadedConfig;
+  paths: PathCheck[];
+  providers: Array<{ id: string; name: string; capabilities: string[] } & ProviderHealth>;
+}): string {
+  const c = d.cfg;
+  const field = (key: string, label: string, value: string, placeholder: string) => `
+<label for="${key}">${esc(label)} <span class="dim">(source: ${esc(c.sources[key] ?? 'default')})</span></label>
+<input type="text" id="${key}" name="${key}" value="${esc(value)}" placeholder="${esc(placeholder)}" spellcheck="false">`;
+  return layout('Settings', '/settings', `
+<h1>Settings / First-Run Setup</h1>
+<p class="dim">Values are saved to <span class="mono">local-config.json</span> (gitignored — machine-specific paths never
+enter the repo). Environment overrides can also be set in <span class="mono">.env.local</span>; the settings saved here take precedence.</p>
+<div class="panel">
+${field('skillsDir', 'Skills directory', c.skillsDir, 'e.g. C:\\Users\\you\\.copilot\\skills (blank = auto-detect)')}
+${field('obsidianVaultDir', 'Obsidian vault root', c.obsidianVaultDir, 'e.g. C:\\Users\\you\\Documents\\Obsidian Notes\\Personal\\Work')}
+${field('dailyLogDir', 'Daily log output folder', c.dailyLogDir, 'blank = ./data/daily-logs')}
+${field('weeklyReportDir', 'Weekly report output folder', c.weeklyReportDir, 'blank = ./data/weekly-reports')}
+${field('wikiSourceDir', 'Wiki source output folder', c.wikiSourceDir, 'blank = ./data/wiki-source')}
+${field('dataDir', 'Local app data folder', c.dataDir, './data')}
+<label for="defaultProvider">Default provider</label>
+<select id="defaultProvider" name="defaultProvider">${providerOptions(c.defaultProvider)}</select>
+${field('claudeCliPath', 'Claude CLI path or command', c.claudeCliPath, 'e.g. claude or C:\\...\\claude.exe')}
+${field('copilotCliPath', 'GitHub Copilot CLI path or command', c.copilotCliPath, 'e.g. copilot or gh')}
+<div class="actions">
+  <button id="saveBtn">Save local config</button>
+  <button id="validateBtn" class="secondary">Validate paths</button>
+</div>
+<div id="settingsMsg" class="msg"></div>
+</div>
+<h2>Path validation</h2>
+<div class="panel" id="pathsPanel">${pathsTable(d.paths)}</div>
+<h2>Provider health</h2>
+<div class="panel"><table><tr><th>Provider</th><th>Health</th><th>Detail</th></tr>${providerRows(d.providers)}</table></div>
+<script>
+const KEYS=['skillsDir','obsidianVaultDir','dailyLogDir','weeklyReportDir','wikiSourceDir','dataDir','defaultProvider','claudeCliPath','copilotCliPath'];
+function collect(){const o={};for(const k of KEYS){o[k]=document.getElementById(k).value.trim()}return o}
+document.getElementById('saveBtn').onclick=async()=>{try{
+await api('/api/config',{method:'POST',body:JSON.stringify(collect())});
+msg('settingsMsg','Saved. Reloading to reflect new paths…',true);setTimeout(()=>location.reload(),700);
+}catch(e){msg('settingsMsg','Save failed: '+e.message,false)}};
+document.getElementById('validateBtn').onclick=async()=>{try{
+const r=await api('/api/paths/validate?'+new URLSearchParams(collect()));
+document.getElementById('pathsPanel').innerHTML=r.html;
+msg('settingsMsg','Validated current field values (not yet saved).',true);
+}catch(e){msg('settingsMsg','Validation failed: '+e.message,false)}};
+</script>`);
+}
+
+export function pageSkills(d: { skills: Skill[]; skillsDir: string; skillsDirSource: string; versionCounts: Record<string, number> }): string {
+  const rows = d.skills
+    .map(
+      (s) => `<tr>
+<td><b>${esc(s.name)}</b><br><span class="dim small">${esc(s.description).slice(0, 140)}</span></td>
+<td>${s.source === 'configured' ? '<span class="badge b-info">configured</span>' : '<span class="badge b-dim">example</span>'}<br><span class="badge b-dim">${esc(s.kind)}</span></td>
+<td class="mono small">${esc(s.relPath)}<br><span class="dim">hash ${esc(s.shortHash)} · v${d.versionCounts[s.id] ?? 1}</span></td>
+<td>
+  <div class="actions" style="margin:0">
+    <button class="secondary" onclick="preview('${esc(s.id)}')">Preview</button>
+    <a href="/inbox?skill=${esc(s.id)}"><button>Run</button></a>
+  </div>
+</td></tr>
+<tr id="prev-${esc(s.id)}" style="display:none"><td colspan="4"><pre id="prevbody-${esc(s.id)}"></pre>
+<div class="small dim">Parsed metadata: <span class="mono">${esc(JSON.stringify(s.meta))}</span></div></td></tr>`,
+    )
+    .join('');
+  return layout('Skills', '/skills', `
+<h1>Skills</h1>
+<p class="dim">Skills directory: <span class="mono">${esc(d.skillsDir || '(none)')}</span> — ${esc(d.skillsDirSource)}.
+Bundled examples from <span class="mono">/examples/skills</span> are always available.</p>
+<div class="panel"><table><tr><th>Skill</th><th>Source / kind</th><th>File</th><th>Actions</th></tr>${rows ||
+    '<tr><td colspan="4" class="dim">No skills found.</td></tr>'}</table></div>
+<script>
+async function preview(id){const row=document.getElementById('prev-'+id);
+if(row.style.display!=='none'){row.style.display='none';return}
+try{const r=await api('/api/skills/raw?id='+id);document.getElementById('prevbody-'+id).textContent=r.raw;
+row.style.display='';}catch(e){alert(e.message)}}
+</script>`);
+}
+
+export function pageInbox(d: { skills: Skill[]; defaultProvider: string; inboxNotes: Array<{ name: string; path: string }>; preselectSkill?: string }): string {
+  const notes = d.inboxNotes.length
+    ? d.inboxNotes
+        .map(
+          (n) => `<tr><td class="mono small">${esc(n.name)}</td>
+<td><button class="secondary" onclick="loadNote('${esc(n.name)}')">Load into editor</button></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="2" class="dim">No saved inbox notes.</td></tr>';
+  return layout('Inbox', '/inbox', `
+<h1>Inbox — Daily Work Log</h1>
+<div class="panel">
+<label for="noteText">Raw dictated notes</label>
+<textarea id="noteText" placeholder="Paste your end-of-day dictated notes here…"></textarea>
+<div class="row">
+  <div><label for="logDate">Log date</label><input type="date" id="logDate"></div>
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'daily-log', d.preselectSkill)}</select></div>
+  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
+  ${MODEL_FIELD}
+</div>
+<div class="actions">
+  <button id="runBtn">Run Daily Work Log</button>
+  <button id="saveNoteBtn" class="secondary">Save note to inbox</button>
+</div>
+<div id="inboxMsg" class="msg"></div>
+<pre id="outputPreview" style="display:none"></pre>
+</div>
+<h2>Saved inbox notes</h2>
+<div class="panel"><table>${notes}</table></div>
+<script>
+${MODEL_JS}
+document.getElementById('logDate').value=new Date().toISOString().slice(0,10);
+async function loadNote(name){try{const r=await api('/api/inbox/read?name='+encodeURIComponent(name));
+document.getElementById('noteText').value=r.text;msg('inboxMsg','Loaded '+name,true)}catch(e){msg('inboxMsg',e.message,false)}}
+document.getElementById('saveNoteBtn').onclick=async()=>{try{
+const t=document.getElementById('noteText').value;if(!t.trim())throw new Error('Nothing to save.');
+const r=await api('/api/inbox',{method:'POST',body:JSON.stringify({text:t})});
+msg('inboxMsg','Saved to '+r.name+' — reload page to see it listed.',true)}catch(e){msg('inboxMsg',e.message,false)}};
+document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
+const body={noteText:document.getElementById('noteText').value,date:document.getElementById('logDate').value,
+skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
+const r=await api('/api/run/daily',{method:'POST',body:JSON.stringify(body)});
+const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
+msg('inboxMsg','Daily log written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
+const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
+const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
+}catch(e){msg('inboxMsg',e.message,false)}finally{b.disabled=false}};
+</script>`);
+}
+
+export function pageWeekly(d: { skills: Skill[]; defaultProvider: string; logs: DailyLogFile[] }): string {
+  const weeks = [...new Set(d.logs.map((l) => l.week).filter(Boolean))].sort().reverse();
+  const weekOpts = weeks.map((w) => `<option value="${esc(w)}">${esc(w)}</option>`).join('') || '<option value="">(no dated logs found)</option>';
+  const logRows = d.logs.length
+    ? d.logs
+        .map(
+          (l) => `<tr><td><input type="checkbox" class="logSel" value="${esc(l.path)}" data-week="${esc(l.week)}"></td>
+<td class="mono small">${esc(l.name)}</td><td class="mono small dim">${esc(l.week || '?')}</td><td class="mono small dim">${esc(l.path)}</td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="4" class="dim">No daily logs found yet — generate one from the Inbox first.</td></tr>';
+  return layout('Weekly Report', '/weekly', `
+<h1>Weekly Director Report</h1>
+<div class="panel">
+<div class="row">
+  <div><label for="weekSel">Week (auto-selects matching logs)</label><select id="weekSel">${weekOpts}</select></div>
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'weekly-report')}</select></div>
+  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
+  ${MODEL_FIELD}
+</div>
+<h2>Daily logs</h2>
+<table><tr><th></th><th>File</th><th>Week</th><th>Path</th></tr>${logRows}</table>
+<div class="actions"><button id="runBtn">Generate Weekly Report</button></div>
+<div id="wkMsg" class="msg"></div>
+<pre id="outputPreview" style="display:none"></pre>
+</div>
+<script>
+${MODEL_JS}
+function selectWeek(){const w=document.getElementById('weekSel').value;
+document.querySelectorAll('.logSel').forEach(c=>{c.checked=c.dataset.week===w})}
+document.getElementById('weekSel').onchange=selectWeek;selectWeek();
+document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
+const files=[...document.querySelectorAll('.logSel:checked')].map(c=>c.value);
+const body={week:document.getElementById('weekSel').value,files,
+skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
+const r=await api('/api/run/weekly',{method:'POST',body:JSON.stringify(body)});
+const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
+msg('wkMsg','Weekly report written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
+const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
+const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
+}catch(e){msg('wkMsg',e.message,false)}finally{b.disabled=false}};
+</script>`);
+}
+
+export function pageWiki(d: {
+  skills: Skill[];
+  defaultProvider: string;
+  logs: DailyLogFile[];
+  reports: Array<{ name: string; path: string }>;
+}): string {
+  const row = (name: string, p: string, kind: string) =>
+    `<tr><td><input type="checkbox" class="srcSel" value="${esc(p)}"></td>
+<td class="mono small">${esc(name)}</td><td class="dim small">${kind}</td><td class="mono small dim">${esc(p)}</td></tr>`;
+  const rows =
+    [...d.logs.map((l) => row(l.name, l.path, 'daily log')), ...d.reports.map((r) => row(r.name, r.path, 'weekly report'))].join('') ||
+    '<tr><td colspan="4" class="dim">No source notes found yet.</td></tr>';
+  return layout('Wiki Source', '/wiki', `
+<h1>Wiki Source Builder</h1>
+<p class="dim">Produces a <b>sanitized</b> source note for wiki/canon material. Draft only — it never edits wiki pages or Git repos.</p>
+<div class="panel">
+<div class="row">
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'wiki-source')}</select></div>
+  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
+  ${MODEL_FIELD}
+</div>
+<h2>Source notes (daily logs + weekly reports)</h2>
+<table><tr><th></th><th>File</th><th>Kind</th><th>Path</th></tr>${rows}</table>
+<div class="actions"><button id="runBtn">Generate Wiki Source</button></div>
+<div id="wikiMsg" class="msg"></div>
+<pre id="outputPreview" style="display:none"></pre>
+</div>
+<script>
+${MODEL_JS}
+document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
+const files=[...document.querySelectorAll('.srcSel:checked')].map(c=>c.value);
+const body={files,skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
+const r=await api('/api/run/wiki',{method:'POST',body:JSON.stringify(body)});
+const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
+msg('wikiMsg','Wiki source written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
+const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
+const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
+}catch(e){msg('wikiMsg',e.message,false)}finally{b.disabled=false}};
+</script>`);
+}
+
+export function pageRuns(d: { runs: RunRecord[] }): string {
+  return layout('Runs', '/runs', `
+<h1>Runs</h1>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Status</th><th>Created</th></tr>
+${runRows(d.runs)}</table></div>`);
+}
+
+export function pageRunDetail(d: { run: RunRecord | null; summary: string; artifactContent: string }): string {
+  if (!d.run) return layout('Run', '/runs', '<h1>Run not found</h1><p><a href="/runs">Back to runs</a></p>');
+  const r = d.run;
+  const kv = (k: string, v: string, mono = true) =>
+    `<tr><th style="width:220px">${esc(k)}</th><td class="${mono ? 'mono ' : ''}small">${v}</td></tr>`;
+  return layout('Run ' + r.id.slice(0, 8), '/runs', `
+<h1>Run <span class="mono">${esc(r.id.slice(0, 8))}</span> ${statusBadge(r.status)}</h1>
+<div class="panel"><table>
+${kv('Run id', esc(r.id))}
+${kv('Summary', esc(d.summary), false)}
+${kv('Artifact type', esc(r.artifact_type))}
+${kv('Skill', `${esc(r.skill_name)} <span class="dim">(${esc(r.skill_id)})</span>`)}
+${kv('Skill file path', esc(r.skill_path))}
+${kv('Skill content hash', esc(r.skill_hash))}
+${kv('Provider', esc(r.provider_id))}
+${kv('Provider command', r.provider_command ? esc(r.provider_command) : '<span class="dim">n/a (in-process)</span>')}
+${kv('Input source', esc(r.input_source))}
+${kv('Input files', r.input_files.length ? r.input_files.map(esc).join('<br>') : '<span class="dim">none</span>')}
+${kv('Output artifact', r.output_artifact_path ? esc(r.output_artifact_path) : '<span class="dim">none</span>')}
+${kv('Created', esc(r.created_at))}
+${kv('Completed', esc(r.completed_at || '—'))}
+${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` : '<span class="dim">none</span>')}
+</table></div>
+<h2>Input text</h2><div class="panel"><pre>${esc(r.input_text || '(empty)')}</pre></div>
+<h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>`);
+}
+
+export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; previewPath: string; previewContent: string }): string {
+  const types = ['', 'daily-log', 'weekly-report', 'wiki-source'];
+  const filterSel = types
+    .map((t) => `<option value="${t}"${t === d.filter ? ' selected' : ''}>${t || 'all types'}</option>`)
+    .join('');
+  const rows = d.artifacts.length
+    ? d.artifacts
+        .map(
+          (a) => `<tr><td>${esc(a.title)}</td><td>${esc(a.type)}</td>
+<td class="mono small dim">${esc(a.path)}</td>
+<td class="small dim">${esc(a.created_at.slice(0, 19).replace('T', ' '))}</td>
+<td><a href="/artifacts?type=${esc(d.filter)}&preview=${encodeURIComponent(a.path)}">preview</a> ·
+<a href="/run?id=${esc(a.run_id)}">run</a></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="dim">No artifacts recorded yet.</td></tr>';
+  const preview = d.previewPath
+    ? `<h2>Preview — <span class="mono">${esc(path.basename(d.previewPath))}</span></h2>
+<div class="panel"><pre>${esc(d.previewContent)}</pre></div>`
+    : '';
+  return layout('Artifacts', '/artifacts', `
+<h1>Artifacts</h1>
+<div class="panel">
+<form method="get" action="/artifacts"><label for="type">Filter by type</label>
+<div class="row"><select name="type" id="type" onchange="this.form.submit()">${filterSel}</select></div></form>
+<table><tr><th>File</th><th>Type</th><th>Path</th><th>Created</th><th></th></tr>${rows}</table>
+</div>
+${preview}`);
+}
+
+export const APP_ROOT_DISPLAY = APP_ROOT;

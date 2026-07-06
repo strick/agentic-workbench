@@ -1,0 +1,17 @@
+{
+  "name": "agentic-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first agentic workbench / control plane for markdown work notes, .copilot/skills, and weekly reporting.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node src/server.ts",
+    "start": "node src/server.ts"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  }
+}
