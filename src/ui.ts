@@ -5,7 +5,8 @@ import { APP_ROOT, type LoadedConfig } from './config.ts';
 import type { PathCheck } from './paths.ts';
 import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
-import type { ApprovalRecord, ArtifactRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
+import type { ApprovalRecord, ArtifactRecord, EvalRunRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
+import type { EvalSuite } from './evals.ts';
 import type { SourceFile } from './workflows.ts';
 import { allOutputTypes, type WorkbenchMode, type WorkflowDef } from './workflowDefs.ts';
 
@@ -72,6 +73,7 @@ const NAV = [
   ['/skills', 'Skills'],
   ['/lab', 'Skill Lab'],
   ['/shootout', 'Shootout'],
+  ['/evals', 'Evals'],
   ['/workflows', 'Workflows'],
   ['/architecture', 'Architecture'],
   ['/runs', 'Runs'],
@@ -770,6 +772,93 @@ ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` 
 <h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>
 <h2>Prompt</h2>
 <div class="panel"><details><summary>Full prompt sent to model</summary><pre>${esc(r.prompt || '(not recorded)')}</pre></details></div>`);
+}
+
+// --- Evals -------------------------------------------------------------------
+
+export function pageEvals(d: {
+  suites: EvalSuite[];
+  skills: Skill[];
+  defaultProvider: string;
+  history: EvalRunRecord[];
+}): string {
+  const suiteRows = d.suites
+    .map(
+      (s) => `<tr>
+<td><b>${esc(s.config.name || s.id)}</b><br><span class="mono small dim">${esc(s.id)} · ${esc(s.source)}</span></td>
+<td class="small">${s.cases.length} case(s)</td>
+<td class="small dim">${esc(s.config.requiredSections.length)} required sections ·
+${s.config.forbiddenPatterns.length} leakage pattern(s) · ${s.config.tonePatterns.length} tone pattern(s)</td>
+<td>${s.rubric ? `<details><summary>rubric</summary><pre style="max-height:220px;overflow:auto">${esc(s.rubric)}</pre></details>` : '<span class="dim">—</span>'}</td>
+</tr>`,
+    )
+    .join('');
+  const suiteOpts = d.suites.map((s) => `<option value="${esc(s.id)}" data-kind="${esc(s.config.skillKind)}">${esc(s.config.name || s.id)}</option>`).join('');
+  const historyRows = d.history.length
+    ? d.history
+        .map(
+          (h) => `<tr><td class="small dim">${esc(h.created_at.slice(0, 19).replace('T', ' '))}</td>
+<td class="mono small">${esc(h.suite_id)}/${esc(h.case_id)}</td>
+<td class="mono small">${esc(h.provider_id)}${h.model ? ` (${esc(h.model)})` : ''}</td>
+<td class="mono small dim">${esc(h.skill_hash.slice(0, 10))}</td>
+<td>${h.failed ? `<span class="badge b-err">${h.passed} pass / ${h.failed} fail</span>` : `<span class="badge b-ok">${h.passed} pass</span>`}</td>
+<td><a href="/run?id=${esc(h.run_id)}">run</a></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="6" class="dim">No eval runs recorded yet.</td></tr>';
+
+  return layout('Evals', '/evals', `
+<h1>Evals</h1>
+<p class="dim">Fixture-based checks for skills: required sections, private-info leakage, source traceability, tone,
+action extraction, and regression diff vs the previous eval. Deterministic and mechanical — you stay the judge of
+quality; the evals catch structural drift. Add your own suites under <span class="mono">data/evals/&lt;name&gt;/</span>
+(same layout as <span class="mono">examples/evals</span>).</p>
+<h2>Suites</h2>
+<div class="panel"><table><tr><th>Suite</th><th>Cases</th><th>Checks configured</th><th>Rubric</th></tr>
+${suiteRows || '<tr><td colspan="4" class="dim">No eval suites found.</td></tr>'}</table></div>
+<h2>Run a suite</h2>
+<div class="panel">
+<div class="row">
+  <div><label for="suiteSel">Suite</label><select id="suiteSel">${suiteOpts}</select></div>
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, d.suites[0]?.config.skillKind ?? 'daily-log')}</select></div>
+  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
+  ${MODEL_FIELD}
+</div>
+<div class="actions"><button id="runBtn">Run eval suite</button></div>
+<div id="evMsg" class="msg"></div>
+<div id="results"></div>
+</div>
+<h2>Eval history</h2>
+<div class="panel"><table><tr><th>When</th><th>Suite/case</th><th>Provider</th><th>Skill hash</th><th>Result</th><th></th></tr>${historyRows}</table></div>
+<script>
+${MODEL_JS}
+const SKILLS=${JSON.stringify(d.skills.map((s) => ({ id: s.id, kind: s.kind, name: s.name })))};
+document.getElementById('suiteSel').onchange=function(){
+const kind=this.selectedOptions[0]?.dataset.kind;
+const match=SKILLS.find(s=>s.kind===kind);
+if(match)document.getElementById('skillSel').value=match.id};
+function badge(st){const cls={pass:'b-ok',fail:'b-err',skip:'b-dim',info:'b-info'}[st]||'b-dim';
+return '<span class="badge '+cls+'">'+st+'</span>'}
+document.getElementById('runBtn').onclick=async()=>{
+const b=document.getElementById('runBtn');b.disabled=true;
+msg('evMsg','Running eval suite (each case is a full provider run — CLI providers can take a while)…',true);
+try{
+const body={suiteId:document.getElementById('suiteSel').value,skillId:document.getElementById('skillSel').value,
+providerId:document.getElementById('provSel').value,model:modelVal()};
+const r=await api('/api/evals/run',{method:'POST',body:JSON.stringify(body)});
+let html='';
+for(const c of r.results){
+html+='<h2>Case '+c.caseId+' — '+(c.status==='completed'?(c.failed?c.failed+' check(s) failed':'all checks passed'):'run failed')+'</h2>';
+if(c.status!=='completed'){html+='<div class="panel"><p style="color:var(--err)">'+(c.error||'')+'</p></div>';continue}
+html+='<div class="panel"><table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>'+
+c.checks.map(ch=>'<tr><td class="mono small">'+ch.check+'</td><td>'+badge(ch.status)+'</td><td class="small">'+
+ch.detail.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</td></tr>').join('')+
+'</table><p class="small dim"><a href="/run?id='+c.runId+'">view run & output</a></p></div>'}
+document.getElementById('results').innerHTML=html;
+const totalFail=r.results.reduce((n,c)=>n+c.failed,0);
+msg('evMsg',totalFail?'Suite finished with '+totalFail+' failed check(s).':'Suite finished — all checks passed.',!totalFail);
+}catch(e){msg('evMsg',e.message,false)}finally{b.disabled=false}};
+</script>`);
 }
 
 // --- Approvals -------------------------------------------------------------------

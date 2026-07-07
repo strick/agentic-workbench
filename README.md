@@ -159,6 +159,33 @@ of the workflows an AI architect produces in a working week:
 Each has a bundled example skill (frontmatter `kind:` matches it to the
 workflow); your own skills of the same kind are preferred automatically.
 
+## Evals
+
+The **Evals** page runs fixture-based checks against a skill + provider. Suites
+live in `examples/evals/<name>/` (add private ones under `data/evals/<name>/`):
+
+```
+examples/evals/
+  daily-log/
+    eval.json      # required sections, leakage patterns, tone patterns, threshold
+    input-001.md   # one case per input file
+    case-001.json  # optional per-case checks (mustContain, extra forbidden patterns)
+    rubric.md      # the human rubric (shown, not executed)
+```
+
+| Check | What it verifies |
+|---|---|
+| required-sections | the output has the structure the skill promises |
+| no-private-leakage | configured names/costs/HR patterns never appear |
+| source-traceability | output bullets are grounded in the source notes |
+| tone | task-log tells ("todo", bug-by-bug bullets) stay out of director-facing docs |
+| action-extraction | expected decisions/blockers/claims survive into the output |
+| regression-diff | output compared (hash + line similarity) with the previous eval of the same suite/case/skill/provider |
+
+Checks are deterministic — no LLM judges. Each case is a real provider run with
+full provenance; results are stored in `eval_runs` with the skill hash, so you
+can see exactly which prompt version regressed.
+
 ## Provider Shootout
 
 The **Shootout** page runs the same input through the same skill on multiple

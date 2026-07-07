@@ -20,6 +20,7 @@ import { getProviders } from './providers/index.ts';
 import { getStore } from './store.ts';
 import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkflowRun } from './workflows.ts';
 import { executeApproval, proposeGitCommit, proposeObsidianWrite } from './actions.ts';
+import { listEvalSuites, runEvalSuite } from './evals.ts';
 import { ARCHITECTURE_MODE, allowedWorkflows, getWorkflow, modeWorkflows } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
@@ -110,6 +111,12 @@ const ProposeSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('git-commit'), message: z.string().min(1).max(500) }),
 ]);
 const DecideSchema = z.object({ id: z.string().min(1), decision: z.enum(['approve', 'reject']) });
+const EvalRunSchema = z.object({
+  suiteId: z.string().min(1),
+  skillId: z.string().min(1),
+  providerId: z.string().min(1),
+  model: ModelSchema,
+});
 
 // --- Route handlers ----------------------------------------------------------
 type Handler = (ctx: Ctx) => Promise<{ status?: number; html?: string; json?: unknown; redirect?: string }>;
@@ -340,6 +347,30 @@ const routes: Record<string, Handler> = {
     store.audit('run.scored', { runId: run.id, score: args.score });
     return { json: { ok: true } };
   },
+
+  'GET /evals': async ({ cfg }) => {
+    const { skills } = loadSkills(cfg);
+    const store = getStore(dataDir(cfg));
+    return {
+      html: ui.pageEvals({
+        suites: listEvalSuites(cfg),
+        skills,
+        defaultProvider: cfg.defaultProvider,
+        history: store.listEvalRuns(40),
+      }),
+    };
+  },
+
+  'POST /api/evals/run': async ({ cfg, body }) => {
+    const args = EvalRunSchema.parse(body ?? {});
+    const result = await runEvalSuite(cfg, args);
+    if ('error' in result) return { status: 400, json: result };
+    return { json: result };
+  },
+
+  'GET /api/evals/suites': async ({ cfg }) => ({
+    json: { suites: listEvalSuites(cfg).map(({ rubric, ...s }) => ({ ...s, hasRubric: !!rubric })) },
+  }),
 
   'GET /approvals': async ({ cfg }) => {
     const store = getStore(dataDir(cfg));
