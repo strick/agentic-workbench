@@ -17,15 +17,8 @@ import { allowedReadRoots, checkAllPaths, isPathAllowed } from './paths.ts';
 import { loadSkills } from './skills.ts';
 import { getProviders } from './providers/index.ts';
 import { getStore } from './store.ts';
-import {
-  listDailyLogs,
-  listInboxNotes,
-  listWeeklyReports,
-  runWeeklyReport,
-  runWikiSource,
-  saveInboxNote,
-  startDailyLog,
-} from './workflows.ts';
+import { listInboxNotes, listSourceFiles, saveInboxNote, startWorkflowRun } from './workflows.ts';
+import { allowedWorkflows, getWorkflow } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
 
@@ -69,23 +62,16 @@ const ModelSchema = z
   .regex(/^[A-Za-z0-9._:-]{0,64}$/, 'Model may only contain letters, digits, . _ : -')
   .optional()
   .transform((v) => v || undefined);
-const DailyRunSchema = z.object({
+const WorkflowRunSchema = z.object({
+  workflowId: z.string().min(1),
   noteText: z.string().optional(),
   inboxFile: z.string().optional(),
-  skillId: z.string().min(1),
-  providerId: z.string().min(1),
-  model: ModelSchema,
-  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().or(z.literal('').transform(() => undefined)),
-});
-const WeeklyRunSchema = z.object({
-  week: z.string().default(''),
-  files: z.array(z.string()).min(1, 'Select at least one daily log.'),
-  skillId: z.string().min(1),
-  providerId: z.string().min(1),
-  model: ModelSchema,
-});
-const WikiRunSchema = z.object({
-  files: z.array(z.string()).min(1, 'Select at least one source note.'),
+  files: z.array(z.string()).optional(),
+  label: z
+    .string()
+    .regex(/^(\d{4}-\d{2}-\d{2}|\d{4}-W\d{2})?$/, 'Label must be YYYY-MM-DD or YYYY-Www.')
+    .optional()
+    .transform((v) => v || undefined),
   skillId: z.string().min(1),
   providerId: z.string().min(1),
   model: ModelSchema,
@@ -93,7 +79,7 @@ const WikiRunSchema = z.object({
 const InboxSchema = z.object({ text: z.string().min(1, 'Note text is empty.') });
 
 // --- Route handlers ----------------------------------------------------------
-type Handler = (ctx: Ctx) => Promise<{ status?: number; html?: string; json?: unknown }>;
+type Handler = (ctx: Ctx) => Promise<{ status?: number; html?: string; json?: unknown; redirect?: string }>;
 
 const routes: Record<string, Handler> = {
   'GET /': async ({ cfg }) => {
@@ -132,34 +118,28 @@ const routes: Record<string, Handler> = {
     return { html: ui.pageSkills({ skills, skillsDir, skillsDirSource, versionCounts }) };
   },
 
-  'GET /inbox': async ({ cfg, url }) => {
+  'GET /workflows': async ({ cfg }) => ({ html: ui.pageWorkflows({ workflows: allowedWorkflows(cfg) }) }),
+
+  'GET /workflow': async ({ cfg, url }) => {
+    const def = getWorkflow(url.searchParams.get('id') ?? '');
+    if (!def) return { redirect: '/workflows' };
     const { skills } = loadSkills(cfg);
     return {
-      html: ui.pageInbox({
+      html: ui.pageWorkflowRun({
+        def,
         skills,
         defaultProvider: cfg.defaultProvider,
+        files: listSourceFiles(cfg, def.inputSource.fileTypes),
         inboxNotes: listInboxNotes(cfg),
         preselectSkill: url.searchParams.get('skill') ?? undefined,
       }),
     };
   },
 
-  'GET /weekly': async ({ cfg }) => {
-    const { skills } = loadSkills(cfg);
-    return { html: ui.pageWeekly({ skills, defaultProvider: cfg.defaultProvider, logs: listDailyLogs(cfg) }) };
-  },
-
-  'GET /wiki': async ({ cfg }) => {
-    const { skills } = loadSkills(cfg);
-    return {
-      html: ui.pageWiki({
-        skills,
-        defaultProvider: cfg.defaultProvider,
-        logs: listDailyLogs(cfg),
-        reports: listWeeklyReports(cfg),
-      }),
-    };
-  },
+  // Legacy page URLs from the three-workflow era.
+  'GET /inbox': async ({ url }) => ({ redirect: `/workflow?id=daily-log${url.searchParams.get('skill') ? `&skill=${url.searchParams.get('skill')}` : ''}` }),
+  'GET /weekly': async () => ({ redirect: '/workflow?id=weekly-report' }),
+  'GET /wiki': async () => ({ redirect: '/workflow?id=wiki-source' }),
 
   'GET /runs': async ({ cfg }) => {
     const store = getStore(dataDir(cfg));
@@ -250,27 +230,13 @@ const routes: Record<string, Handler> = {
     return { json: { text: readAllowedFile(cfg, p) } };
   },
 
-  'POST /api/run/daily': async ({ cfg, body }) => {
-    const args = DailyRunSchema.parse(body ?? {});
-    const result = startDailyLog(cfg, args);
+  'GET /api/workflows': async ({ cfg }) => ({ json: { workflows: allowedWorkflows(cfg) } }),
+
+  'POST /api/run/workflow': async ({ cfg, body }) => {
+    const args = WorkflowRunSchema.parse(body ?? {});
+    const result = startWorkflowRun(cfg, args);
     if ('error' in result) return { status: 400, json: result };
     return { status: 202, json: result };
-  },
-
-  'POST /api/run/weekly': async ({ cfg, body }) => {
-    const args = WeeklyRunSchema.parse(body ?? {});
-    const result = await runWeeklyReport(cfg, args);
-    if ('error' in result && !('runId' in result)) return { status: 400, json: result };
-    if ('status' in result && result.status === 'error') return { status: 422, json: { error: result.error, runId: result.runId } };
-    return { json: result };
-  },
-
-  'POST /api/run/wiki': async ({ cfg, body }) => {
-    const args = WikiRunSchema.parse(body ?? {});
-    const result = await runWikiSource(cfg, args);
-    if ('error' in result && !('runId' in result)) return { status: 400, json: result };
-    if ('status' in result && result.status === 'error') return { status: 422, json: { error: result.error, runId: result.runId } };
-    return { json: result };
   },
 
   'GET /api/runs': async ({ cfg }) => ({ json: { runs: getStore(dataDir(cfg)).listRuns(200) } }),
@@ -396,6 +362,11 @@ const server = http.createServer(async (req, res) => {
     }
     const body = req.method === 'POST' ? await readBody(req) : undefined;
     const result = await handler({ cfg, url, body });
+    if (result.redirect !== undefined) {
+      res.writeHead(302, { Location: result.redirect });
+      res.end();
+      return;
+    }
     if (result.html !== undefined) {
       res.writeHead(result.status ?? 200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(result.html);

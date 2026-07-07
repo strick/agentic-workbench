@@ -12,7 +12,7 @@ export type Skill = {
   source: 'configured' | 'examples';
   hash: string; // sha256 of file content
   shortHash: string;
-  kind: 'daily-log' | 'weekly-report' | 'wiki-source' | 'other';
+  kind: string; // preferred workflow kind, e.g. 'daily-log', 'adr', 'other'
   meta: Record<string, string>;
   body: string; // markdown body (frontmatter stripped)
   raw: string; // full file content
@@ -56,8 +56,17 @@ export function parseFrontmatter(raw: string): { meta: Record<string, string>; b
 }
 
 function guessKind(name: string, meta: Record<string, string>, filePath: string): Skill['kind'] {
-  const hay = `${meta.kind ?? ''} ${meta.tags ?? ''} ${name} ${path.basename(filePath)}`.toLowerCase();
-  if (/wiki|canon|sanitiz/.test(hay)) return 'wiki-source';
+  // Explicit frontmatter `kind:` always wins.
+  const explicit = (meta.kind ?? '').trim().toLowerCase().replace(/\s+/g, '-');
+  if (explicit) return explicit;
+  const hay = `${meta.tags ?? ''} ${name} ${path.basename(filePath)}`.toLowerCase();
+  if (/\badr\b|decision[- ]record/.test(hay)) return 'adr';
+  if (/canon/.test(hay)) return 'canon-note';
+  if (/review[- ]board|packet/.test(hay)) return 'review-packet';
+  if (/sprint|planning/.test(hay)) return 'planning-brief';
+  if (/1[:-]?1|one[- ]on[- ]one|talking[- ]point/.test(hay)) return 'talking-points';
+  if (/\bqa\b|critique|quality/.test(hay)) return 'qa-critique';
+  if (/wiki|sanitiz/.test(hay)) return 'wiki-source';
   if (/week/.test(hay)) return 'weekly-report';
   if (/daily|work[- ]?log|day[- ]?log/.test(hay)) return 'daily-log';
   return 'other';

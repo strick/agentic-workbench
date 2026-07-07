@@ -94,17 +94,31 @@ not-configured**. A missing path never crashes the app — outputs just fall bac
 files. `examples/` **is** committed on purpose. Before pushing, `git status` should show
 only source/docs changes.
 
-## The three workflows
+## Workflows
 
-1. **Inbox → Daily Work Log** — paste dictated notes, pick a daily-log skill + provider,
-   run. Output sections: Date, Executive Summary, Work Completed, Architecture/Strategy
-   Notes, Decisions, Risks/Blockers, Follow-ups, People/Stakeholders, Tags, Source Notes Used.
-2. **Weekly Director Report** — pick a week; matching daily logs are auto-selected. Output:
-   Executive Summary, Strategic Progress, Delivery Evidence, Decisions/Alignment Needed,
-   Risks/Gaps/Tradeoffs, Next Week Focus. Director-ready tone, not a task log.
-3. **Wiki Source Builder** — select daily logs + weekly reports; produces a *sanitized*
-   source note (Summary, Major Updates, Decisions, Open Questions, Suggested Wiki Updates,
-   Source Notes Reviewed, Excluded Material). It never edits wikis or Git repos.
+Every workflow is the same general model:
+
+> **Skill + Input Source + Provider + Output Type + Destination + Approval Rule**
+
+The **Workflows** page lists the built-in templates; each opens a run page whose
+input controls (paste box, source-file picker, date/week label) are derived from
+the template's input source. Built-in templates:
+
+| Workflow | Input | Output |
+|---|---|---|
+| Daily Work Log | dictated notes | structured daily markdown |
+| Weekly Director Report | daily logs | director-ready summary |
+| Wiki Source Builder | logs + reports | sanitized wiki source note |
+| Architecture Canon Update | work logs + architecture notes | sanitized canon note |
+| ADR Generator | rough decision notes | formal ADR |
+| Review Board Packet | architecture docs | decision packet |
+| Sprint Planning Prep | notes + backlog | planning brief |
+| 1:1 Prep | recent work + blockers | talking points |
+| Fable Output QA | AI-generated docs | critique + improvement plan |
+
+Outputs for the original three types go to their configured folders; the newer
+types write to subfolders of `./data` (e.g. `data/adrs`). Legacy URLs
+(`/inbox`, `/weekly`, `/wiki`) redirect to the corresponding workflow page.
 
 Every run records: run id, skill id/path/content-hash, provider, input source, input
 text/files, output artifact path, artifact type, status, timestamps, and errors. See the

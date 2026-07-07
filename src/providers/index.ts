@@ -4,9 +4,10 @@ import { execFile, spawn } from 'node:child_process';
 import { resolveConfigPath, type Config, type ProviderId } from '../config.ts';
 import type { Skill } from '../skills.ts';
 import type { Store } from '../store.ts';
-import { genDailyLog, genWeeklyReport, genWikiSource } from '../generate.ts';
+import { genDailyLog, genGeneric, genWeeklyReport, genWikiSource } from '../generate.ts';
 
-export type ArtifactType = 'daily-log' | 'weekly-report' | 'wiki-source';
+/** Open set of workflow output types ('daily-log', 'adr', 'review-packet', ...). */
+export type ArtifactType = string;
 
 /** GitHub Copilot "premium request" credit price: $100 buys 10,000 credits. */
 const USD_PER_CREDIT = 0.01;
@@ -103,12 +104,22 @@ export class MockProvider implements AgentProvider {
           skill: req.skill,
           providerId: this.id,
         });
-      } else {
+      } else if (req.artifactType === 'wiki-source') {
         output = genWikiSource({
           date: req.date,
           sources: req.inputFiles,
           skill: req.skill,
           providerId: this.id,
+        });
+      } else {
+        output = genGeneric({
+          outputType: req.artifactType,
+          label: req.date,
+          inputText: req.inputText,
+          sources: req.inputFiles,
+          skill: req.skill,
+          providerId: this.id,
+          sourceRef: req.sourceRef,
         });
       }
       req.onChunk?.('[mock] done.');
