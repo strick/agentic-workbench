@@ -18,6 +18,8 @@ export const ConfigSchema = z.object({
   dailyLogDir: z.string().default(''),
   weeklyReportDir: z.string().default(''),
   wikiSourceDir: z.string().default(''),
+  /** Git repo where approval-gated commits may be created ('' = disabled). */
+  gitRepoDir: z.string().default(''),
   defaultProvider: ProviderIdSchema.default('mock'),
   claudeCliPath: z.string().default(''),
   copilotCliPath: z.string().default(''),
@@ -34,6 +36,7 @@ const ENV_MAP: Record<string, keyof Config> = {
   WORKBENCH_DAILY_LOG_DIR: 'dailyLogDir',
   WORKBENCH_WEEKLY_REPORT_DIR: 'weeklyReportDir',
   WORKBENCH_WIKI_SOURCE_DIR: 'wikiSourceDir',
+  WORKBENCH_GIT_REPO_DIR: 'gitRepoDir',
   WORKBENCH_DEFAULT_PROVIDER: 'defaultProvider',
   CLAUDE_CLI_PATH: 'claudeCliPath',
   COPILOT_CLI_PATH: 'copilotCliPath',

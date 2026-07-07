@@ -5,7 +5,7 @@ import { APP_ROOT, type LoadedConfig } from './config.ts';
 import type { PathCheck } from './paths.ts';
 import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
-import type { ArtifactRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
+import type { ApprovalRecord, ArtifactRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
 import type { SourceFile } from './workflows.ts';
 import { allOutputTypes, type WorkbenchMode, type WorkflowDef } from './workflowDefs.ts';
 
@@ -76,6 +76,7 @@ const NAV = [
   ['/architecture', 'Architecture'],
   ['/runs', 'Runs'],
   ['/artifacts', 'Artifacts'],
+  ['/approvals', 'Approvals'],
 ] as const;
 
 export function layout(title: string, active: string, content: string): string {
@@ -224,6 +225,7 @@ ${field('dailyLogDir', 'Daily log output folder', c.dailyLogDir, 'blank = ./data
 ${field('weeklyReportDir', 'Weekly report output folder', c.weeklyReportDir, 'blank = ./data/weekly-reports')}
 ${field('wikiSourceDir', 'Wiki source output folder', c.wikiSourceDir, 'blank = ./data/wiki-source')}
 ${field('dataDir', 'Local app data folder', c.dataDir, './data')}
+${field('gitRepoDir', 'Git repo for approval-gated commits', c.gitRepoDir, 'e.g. C:\\path\\to\\notes-repo (blank = git actions disabled)')}
 <label for="defaultProvider">Default provider</label>
 <select id="defaultProvider" name="defaultProvider">${providerOptions(c.defaultProvider)}</select>
 ${field('claudeCliPath', 'Claude CLI path or command', c.claudeCliPath, 'e.g. claude or C:\\...\\claude.exe')}
@@ -239,7 +241,7 @@ ${field('copilotCliPath', 'GitHub Copilot CLI path or command', c.copilotCliPath
 <h2>Provider health</h2>
 <div class="panel"><table><tr><th>Provider</th><th>Health</th><th>Detail</th></tr>${providerRows(d.providers)}</table></div>
 <script>
-const KEYS=['skillsDir','obsidianVaultDir','dailyLogDir','weeklyReportDir','wikiSourceDir','dataDir','defaultProvider','claudeCliPath','copilotCliPath'];
+const KEYS=['skillsDir','obsidianVaultDir','dailyLogDir','weeklyReportDir','wikiSourceDir','dataDir','gitRepoDir','defaultProvider','claudeCliPath','copilotCliPath'];
 function collect(){const o={};for(const k of KEYS){o[k]=document.getElementById(k).value.trim()}return o}
 document.getElementById('saveBtn').onclick=async()=>{try{
 await api('/api/config',{method:'POST',body:JSON.stringify(collect())});
@@ -770,6 +772,69 @@ ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` 
 <div class="panel"><details><summary>Full prompt sent to model</summary><pre>${esc(r.prompt || '(not recorded)')}</pre></details></div>`);
 }
 
+// --- Approvals -------------------------------------------------------------------
+
+export function pageApprovals(d: { approvals: ApprovalRecord[]; vaultConfigured: boolean; gitRepoConfigured: boolean }): string {
+  const pending = d.approvals.filter((a) => a.status === 'pending');
+  const decided = d.approvals.filter((a) => a.status !== 'pending');
+  const pendingCards = pending.length
+    ? pending
+        .map(
+          (a) => `<div class="panel" id="ap-${esc(a.id)}">
+<b>${esc(a.action)}</b> → <span class="mono small">${esc(a.target)}</span>
+<span class="dim small"> · proposed ${esc(a.created_at.slice(0, 19).replace('T', ' '))}</span>
+<pre style="max-height:320px;overflow:auto">${esc(a.preview)}</pre>
+<div class="actions">
+  <button onclick="decide('${esc(a.id)}','approve',this)">Approve & execute</button>
+  <button class="secondary" onclick="decide('${esc(a.id)}','reject',this)">Reject</button>
+</div></div>`,
+        )
+        .join('')
+    : '<div class="panel dim">No pending approvals. Propose one from the Artifacts page (→ Obsidian) or below (git commit).</div>';
+  const decidedRows = decided.length
+    ? decided
+        .map(
+          (a) => `<tr><td>${esc(a.action)}</td><td class="mono small">${esc(a.target)}</td>
+<td>${statusBadge(a.status)}</td><td class="small">${esc(a.result).slice(0, 160)}</td>
+<td class="small dim">${esc(a.decided_at.slice(0, 19).replace('T', ' '))}</td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="dim">Nothing decided yet.</td></tr>';
+  const gitForm = d.gitRepoConfigured
+    ? `<label for="commitMsg">Commit message</label>
+<input type="text" id="commitMsg" placeholder="e.g. Add sanitized canon notes for week 27" spellcheck="false">
+<div class="actions"><button class="secondary" onclick="proposeCommit()">Preview & propose git commit</button></div>`
+    : `<p class="dim">Configure a Git repo in <a href="/settings">Settings</a> to enable approval-gated commits.</p>`;
+
+  return layout('Approvals', '/approvals', `
+<h1>Approvals</h1>
+<p class="dim">The workbench <b>prepares</b> external actions; <b>you approve</b> every write. Nothing outside the
+app's own data/output folders is ever touched without an explicit approval here. Approving executes exactly the
+previewed action; rejecting discards it. ${d.vaultConfigured ? '' : 'Configure an Obsidian vault in Settings to enable vault writes.'}</p>
+<div id="apMsg" class="msg"></div>
+<h2>Pending</h2>
+${pendingCards}
+<h2>Propose a git commit</h2>
+<div class="panel">${gitForm}
+<p class="dim small">On approval the workbench runs <span class="mono">git add -A && git commit -m &lt;message&gt;</span> in the configured repo. It never pushes.</p>
+</div>
+<h2>History</h2>
+<div class="panel"><table><tr><th>Action</th><th>Target</th><th>Status</th><th>Result</th><th>Decided</th></tr>${decidedRows}</table></div>
+<script>
+async function decide(id,decision,btn){
+btn.disabled=true;
+try{const r=await api('/api/approvals/decide',{method:'POST',body:JSON.stringify({id,decision})});
+msg('apMsg',(decision==='approve'?'Executed: ':'')+r.result,true);
+setTimeout(()=>location.reload(),900);
+}catch(e){msg('apMsg',e.message,false);btn.disabled=false}}
+async function proposeCommit(){
+try{const m=document.getElementById('commitMsg').value;
+const r=await api('/api/actions/propose',{method:'POST',body:JSON.stringify({type:'git-commit',message:m})});
+msg('apMsg','Proposed — reloading to show preview…',true);setTimeout(()=>location.reload(),700);
+}catch(e){msg('apMsg',e.message,false)}}
+</script>`);
+}
+
 export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; previewPath: string; previewContent: string }): string {
   const types = ['', ...allOutputTypes()];
   const filterSel = types
@@ -782,7 +847,8 @@ export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; 
 <td class="mono small dim">${esc(a.path)}</td>
 <td class="small dim">${esc(a.created_at.slice(0, 19).replace('T', ' '))}</td>
 <td><a href="/artifacts?type=${esc(d.filter)}&preview=${encodeURIComponent(a.path)}">preview</a> ·
-<a href="/run?id=${esc(a.run_id)}">run</a></td></tr>`,
+<a href="/run?id=${esc(a.run_id)}">run</a> ·
+<a href="#" onclick="toObsidian('${esc(encodeURIComponent(a.path))}');return false">→ Obsidian</a></td></tr>`,
         )
         .join('')
     : '<tr><td colspan="5" class="dim">No artifacts recorded yet.</td></tr>';
@@ -796,8 +862,20 @@ export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; 
 <form method="get" action="/artifacts"><label for="type">Filter by type</label>
 <div class="row"><select name="type" id="type" onchange="this.form.submit()">${filterSel}</select></div></form>
 <table><tr><th>File</th><th>Type</th><th>Path</th><th>Created</th><th></th></tr>${rows}</table>
+<div id="artMsg" class="msg"></div>
 </div>
-${preview}`);
+${preview}
+<script>
+async function toObsidian(encPath){
+const subdir=prompt('Vault subfolder to propose writing into:','inbox');
+if(subdir===null)return;
+try{
+const r=await api('/api/actions/propose',{method:'POST',body:JSON.stringify({type:'obsidian-write',
+artifactPath:decodeURIComponent(encPath),subdir})});
+const link=document.createElement('a');link.href='/approvals';link.textContent='review & approve it on the Approvals page';
+msg('artMsg','Proposed write to '+r.target+' — ',true,link);
+}catch(e){msg('artMsg',e.message,false)}}
+</script>`);
 }
 
 export const APP_ROOT_DISPLAY = APP_ROOT;

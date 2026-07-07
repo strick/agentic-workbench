@@ -60,6 +60,7 @@ const PATH_LABELS: Array<{ key: keyof Config & string; label: string; output: bo
   { key: 'weeklyReportDir', label: 'Weekly report output folder', output: true },
   { key: 'wikiSourceDir', label: 'Wiki source output folder', output: true },
   { key: 'dataDir', label: 'Local app data folder', output: true },
+  { key: 'gitRepoDir', label: 'Git repo (approval-gated commits)', output: false },
 ];
 
 /** Validate all configured paths; never throws, never creates external dirs. */
