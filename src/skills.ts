@@ -61,6 +61,11 @@ function guessKind(name: string, meta: Record<string, string>, filePath: string)
   if (explicit) return explicit;
   const hay = `${meta.tags ?? ''} ${name} ${path.basename(filePath)}`.toLowerCase();
   if (/\badr\b|decision[- ]record/.test(hay)) return 'adr';
+  if (/decision[- ]extract|decision[- ]register/.test(hay)) return 'decision-extract';
+  if (/risk[- ](extract|register)/.test(hay)) return 'risk-extract';
+  if (/backlog|roadmap/.test(hay)) return 'backlog';
+  if (/alignment|foundry/.test(hay)) return 'alignment-review';
+  if (/talk[- ]track/.test(hay)) return 'talk-track';
   if (/canon/.test(hay)) return 'canon-note';
   if (/review[- ]board|packet/.test(hay)) return 'review-packet';
   if (/sprint|planning/.test(hay)) return 'planning-brief';

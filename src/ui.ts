@@ -7,7 +7,7 @@ import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
 import type { ArtifactRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
 import type { SourceFile } from './workflows.ts';
-import { allOutputTypes, type WorkflowDef } from './workflowDefs.ts';
+import { allOutputTypes, type WorkbenchMode, type WorkflowDef } from './workflowDefs.ts';
 
 export function esc(s: unknown): string {
   return String(s ?? '')
@@ -73,6 +73,7 @@ const NAV = [
   ['/lab', 'Skill Lab'],
   ['/shootout', 'Shootout'],
   ['/workflows', 'Workflows'],
+  ['/architecture', 'Architecture'],
   ['/runs', 'Runs'],
   ['/artifacts', 'Artifacts'],
 ] as const;
@@ -603,6 +604,31 @@ msg('labMsg','Comparison finished.',true);b.disabled=false}
 }
 }catch(e){msg('labMsg',e.message,false);b.disabled=false}};
 </script>`);
+}
+
+// --- Architecture Mode -----------------------------------------------------------
+
+export function pageMode(d: { mode: WorkbenchMode; workflows: WorkflowDef[]; skillCounts: Record<string, number> }): string {
+  const m = d.mode;
+  const rows = d.workflows
+    .map(
+      (w) => `<tr>
+<td><b>${esc(w.name)}</b><br><span class="dim small">${esc(w.description)}</span></td>
+<td class="small dim">${esc(w.inputSource.label)}</td>
+<td><span class="badge b-dim">${esc(w.outputType)}</span></td>
+<td class="small">${d.skillCounts[w.skillKind] ?? 0} skill(s)</td>
+<td><a href="/workflow?id=${esc(w.id)}"><button>Open</button></a></td></tr>`,
+    )
+    .join('');
+  return layout(m.name, '/architecture', `
+<h1>${esc(m.name)}</h1>
+<p class="dim"><b>${esc(m.tagline)}</b> ${esc(m.description)}</p>
+<div class="panel"><table>
+<tr><th>Workflow</th><th>Input</th><th>Output</th><th>Matching skills</th><th></th></tr>
+${rows}</table></div>
+<p class="dim small">Each workflow prefers skills of its kind (frontmatter <span class="mono">kind:</span> or filename
+match) but can run any skill. Test new skill wording in the <a href="/lab">Skill Lab</a> and compare providers in a
+<a href="/shootout">Shootout</a> before trusting a workflow with real notes.</p>`);
 }
 
 // --- Provider Shootout ---------------------------------------------------------

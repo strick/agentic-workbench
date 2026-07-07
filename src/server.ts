@@ -19,7 +19,7 @@ import { loadSkills } from './skills.ts';
 import { getProviders } from './providers/index.ts';
 import { getStore } from './store.ts';
 import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkflowRun } from './workflows.ts';
-import { allowedWorkflows, getWorkflow } from './workflowDefs.ts';
+import { ARCHITECTURE_MODE, allowedWorkflows, getWorkflow, modeWorkflows } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
 
@@ -141,6 +141,13 @@ const routes: Record<string, Handler> = {
   },
 
   'GET /workflows': async ({ cfg }) => ({ html: ui.pageWorkflows({ workflows: allowedWorkflows(cfg) }) }),
+
+  'GET /architecture': async ({ cfg }) => {
+    const { skills } = loadSkills(cfg);
+    const skillCounts: Record<string, number> = {};
+    for (const s of skills) skillCounts[s.kind] = (skillCounts[s.kind] ?? 0) + 1;
+    return { html: ui.pageMode({ mode: ARCHITECTURE_MODE, workflows: modeWorkflows(ARCHITECTURE_MODE), skillCounts }) };
+  },
 
   'GET /workflow': async ({ cfg, url }) => {
     const def = getWorkflow(url.searchParams.get('id') ?? '');
