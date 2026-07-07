@@ -57,7 +57,7 @@ Bad values are dropped individually — a corrupt config never prevents startup.
 | RunScore | DB | human good/okay/bad rating of a run's output (id = run id, re-scoring replaces) |
 | Artifact | DB + markdown file | type: daily-log / weekly-report / wiki-source |
 | ConfigPath | DB snapshot of last validation | status: writable / read-only / missing / unreadable / not-configured |
-| Approval | DB table (placeholder) | reserved for future external writes (wiki/Git/email) — nothing in MVP needs approval because nothing external is written |
+| Approval | DB | prepared external action: type, target, JSON payload, human preview, decision, execution result |
 | AuditEvent | DB | server start, config saves, run lifecycle, artifact writes |
 
 ## Provider contract
@@ -143,10 +143,16 @@ runs on `comparison_id` — no extra tables.
 - **Read gate**: preview/read endpoints only serve files under `allowedReadRoots` =
   skills dir, examples, vault, output dirs, data dir. Workflow inputs are further limited
   to files the app itself enumerated.
-- **No external effects**: no email/ADO/Teams/ServiceNow/wiki/Git writes. The only
-  subprocesses ever spawned are the configured provider CLIs (via `execFile`, no shell)
-  and `where`/`which` health checks; Copilot gets no tool permissions. The `approvals`
-  table exists so future external writes can be gated explicitly.
+- **No unattended external effects**: no email/ADO/Teams/ServiceNow/wiki writes. The
+  subprocesses ever spawned are the configured provider CLIs (via `execFile`, no shell),
+  `where`/`which` health checks, and `git` for approved commits; Copilot gets no tool
+  permissions.
+- **Approval-gated writes** (`actions.ts`): proposing an action never touches the
+  target — it creates an approval record with a full preview (content/line-diff for
+  vault writes; `git status` + diff stats for commits). Execution happens only on an
+  explicit approve, only through `actions.ts`, re-validates the target at execution
+  time (vault containment, repo unchanged), never overwrites files, never pushes.
+  A decided approval cannot be re-executed; failures are recorded on the record.
 - **Git hygiene**: `.gitignore` excludes `.env.local`, `local-config.json`, `/data/`,
   `/runs/`, `/artifacts/`, `*.db|sqlite*`. Machine paths live only in local config.
 

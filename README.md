@@ -187,11 +187,30 @@ Each run form has an optional **Model** field passed straight through as `--mode
 
 ## Safety model
 
-Draft-only outputs. No email, ADO, Teams, ServiceNow, wiki, or Git writes. No file
+Draft-first outputs. No email, ADO, Teams, ServiceNow, or wiki writes. No file
 deletion. No shell execution — only the configured provider CLIs via `execFile` (plus
-`where`/`which` for health checks), and Copilot runs without any tool permissions.
-Writes are hard-gated to the configured output folders plus `./data` — anything else is
-refused. An `audit_events` table records config changes, runs, and artifact writes.
+`where`/`which` for health checks, and `git` for approval-gated commits), and Copilot
+runs without any tool permissions. Automatic writes are hard-gated to the configured
+output folders plus `./data` — anything else is refused. An `audit_events` table
+records config changes, runs, artifact writes, and every approval decision.
+
+### Approval-gated external writes
+
+The one deliberate exception to draft-only:
+
+> **The workbench may prepare actions. Humans approve writes.**
+
+Two action types exist today, both proposed with a full preview and executed only
+when you click **Approve** on the **Approvals** page:
+
+| Action | Preview | On approval |
+|---|---|---|
+| Write to Obsidian vault | target path + content (or line diff vs the existing file) | file copied into the vault; existing files are never overwritten (numeric suffix) |
+| Create Git commit | `git status --porcelain` + diff stats + exact message | `git add -A && git commit -m <msg>` in the configured repo — never a push |
+
+Propose vault writes from the **Artifacts** page (→ Obsidian); propose commits from
+the Approvals page. Rejecting discards the action; nothing is written. Every
+proposal, decision, and execution result is stored and audited.
 
 ## Verify the MVP in 2 minutes
 

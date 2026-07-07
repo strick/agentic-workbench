@@ -19,6 +19,7 @@ import { loadSkills } from './skills.ts';
 import { getProviders } from './providers/index.ts';
 import { getStore } from './store.ts';
 import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkflowRun } from './workflows.ts';
+import { executeApproval, proposeGitCommit, proposeObsidianWrite } from './actions.ts';
 import { ARCHITECTURE_MODE, allowedWorkflows, getWorkflow, modeWorkflows } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
@@ -99,6 +100,16 @@ const ScoreSchema = z.object({
   score: z.enum(['good', 'okay', 'bad']),
   note: z.string().default(''),
 });
+const ProposeSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('obsidian-write'),
+    artifactPath: z.string().min(1),
+    subdir: z.string().max(200).default('inbox'),
+    filename: z.string().max(200).default(''),
+  }),
+  z.object({ type: z.literal('git-commit'), message: z.string().min(1).max(500) }),
+]);
+const DecideSchema = z.object({ id: z.string().min(1), decision: z.enum(['approve', 'reject']) });
 
 // --- Route handlers ----------------------------------------------------------
 type Handler = (ctx: Ctx) => Promise<{ status?: number; html?: string; json?: unknown; redirect?: string }>;
@@ -328,6 +339,35 @@ const routes: Record<string, Handler> = {
     store.scoreRun(run.id, run.skill_id, args.score, args.note);
     store.audit('run.scored', { runId: run.id, score: args.score });
     return { json: { ok: true } };
+  },
+
+  'GET /approvals': async ({ cfg }) => {
+    const store = getStore(dataDir(cfg));
+    return {
+      html: ui.pageApprovals({
+        approvals: store.listApprovals(),
+        vaultConfigured: !!cfg.obsidianVaultDir,
+        gitRepoConfigured: !!cfg.gitRepoDir,
+      }),
+    };
+  },
+
+  'POST /api/actions/propose': async ({ cfg, body }) => {
+    const args = ProposeSchema.parse(body ?? {});
+    const result =
+      args.type === 'obsidian-write'
+        ? proposeObsidianWrite(cfg, { artifactPath: args.artifactPath, subdir: args.subdir, filename: args.filename || undefined })
+        : await proposeGitCommit(cfg, { message: args.message });
+    if ('error' in result) return { status: 400, json: result };
+    return { status: 201, json: { ok: true, id: result.id, target: result.target } };
+  },
+
+  'GET /api/approvals': async ({ cfg }) => ({ json: { approvals: getStore(dataDir(cfg)).listApprovals() } }),
+
+  'POST /api/approvals/decide': async ({ cfg, body }) => {
+    const args = DecideSchema.parse(body ?? {});
+    const result = await executeApproval(cfg, args.id, args.decision);
+    return { status: result.ok ? 200 : 422, json: result };
   },
 
   'GET /runs': async ({ cfg }) => {

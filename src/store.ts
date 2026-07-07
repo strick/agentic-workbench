@@ -67,6 +67,18 @@ export type RunScore = {
 
 export type SkillVersionRow = { id: string; skill_id: string; hash: string; seen_at: string };
 
+export type ApprovalRecord = {
+  id: string;
+  action: string; // 'obsidian-write' | 'git-commit' | future action types
+  target: string; // human-readable target (path / repo)
+  status: 'pending' | 'approved' | 'rejected';
+  payload: string; // JSON args needed to execute the action
+  preview: string; // what the human sees before deciding (content, diff, git status)
+  result: string; // what actually happened on execution ('' until decided)
+  created_at: string;
+  decided_at: string;
+};
+
 export type ArtifactRecord = {
   id: string;
   run_id: string;
@@ -166,6 +178,9 @@ export class Store {
         `ALTER TABLE runs ADD COLUMN credits_used REAL DEFAULT 0`,
         `ALTER TABLE runs ADD COLUMN prompt TEXT DEFAULT ''`,
         `ALTER TABLE runs ADD COLUMN comparison_id TEXT DEFAULT ''`,
+        `ALTER TABLE approvals ADD COLUMN payload TEXT DEFAULT ''`,
+        `ALTER TABLE approvals ADD COLUMN preview TEXT DEFAULT ''`,
+        `ALTER TABLE approvals ADD COLUMN result TEXT DEFAULT ''`,
       ]) {
         try {
           this.db.exec(stmt);
@@ -381,6 +396,49 @@ export class Store {
 
   getArtifact(id: string): ArtifactRecord | null {
     return (this.selectAll('artifacts') as unknown as ArtifactRecord[]).find((a) => a.id === id) ?? null;
+  }
+
+  // --- Approvals: prepared external actions awaiting a human decision --------
+  createApproval(a: Pick<ApprovalRecord, 'action' | 'target' | 'payload' | 'preview'>): ApprovalRecord {
+    const full: ApprovalRecord = {
+      ...a,
+      id: crypto.randomUUID(),
+      status: 'pending',
+      result: '',
+      created_at: now(),
+      decided_at: '',
+    };
+    this.insert('approvals', { ...full });
+    return full;
+  }
+
+  getApproval(id: string): ApprovalRecord | null {
+    const row = this.selectAll('approvals').find((r) => r.id === id);
+    return row ? this.rowToApproval(row) : null;
+  }
+
+  listApprovals(): ApprovalRecord[] {
+    return this.selectAll('approvals')
+      .map((r) => this.rowToApproval(r))
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+  }
+
+  decideApproval(id: string, status: 'approved' | 'rejected', result: string): void {
+    this.updateById('approvals', id, { status, result, decided_at: now() });
+  }
+
+  private rowToApproval(r: Record<string, unknown>): ApprovalRecord {
+    return {
+      id: String(r.id ?? ''),
+      action: String(r.action ?? ''),
+      target: String(r.target ?? ''),
+      status: (String(r.status ?? 'pending') as ApprovalRecord['status']) || 'pending',
+      payload: String(r.payload ?? ''),
+      preview: String(r.preview ?? ''),
+      result: String(r.result ?? ''),
+      created_at: String(r.created_at ?? ''),
+      decided_at: String(r.decided_at ?? ''),
+    };
   }
 
   // --- Skill Lab: version history, prefs, golden examples, scores -----------
