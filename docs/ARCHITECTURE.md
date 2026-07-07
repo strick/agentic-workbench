@@ -118,6 +118,14 @@ output captured against the skill hash that produced them). Lab runs reuse the
 normal workflow engine and provenance but always write to `data/lab-outputs`,
 and lab outputs never appear as workflow source files.
 
+## Provider Shootout
+
+`/shootout` launches the same skill + input across ≥2 providers concurrently
+(each a normal run sharing a `comparison_id`, sandboxed to `data/shootouts`),
+then polls `GET /api/lab/comparison` for a metrics table: duration, status,
+output size, reported cost, and human score. History is derived by grouping
+runs on `comparison_id` — no extra tables.
+
 ## Safety model
 
 - **Write gate**: `safeWriteFile` refuses any target outside `allowedWriteRoots` =

@@ -215,13 +215,60 @@ const routes: Record<string, Handler> = {
     const runs = store.listRunsByComparison(url.searchParams.get('id') ?? '');
     return {
       json: {
-        runs: runs.map((r) => ({
-          ...r,
-          score: store.getRunScore(r.id)?.score ?? '',
-          durationMs: r.completed_at ? new Date(r.completed_at).getTime() - new Date(r.created_at).getTime() : null,
-        })),
+        runs: runs.map((r) => {
+          let outputLength: number | null = null;
+          if (r.output_artifact_path) {
+            try {
+              outputLength = fs.statSync(r.output_artifact_path).size;
+            } catch {
+              /* unreadable — leave null */
+            }
+          }
+          return {
+            ...r,
+            score: store.getRunScore(r.id)?.score ?? '',
+            durationMs: r.completed_at ? new Date(r.completed_at).getTime() - new Date(r.created_at).getTime() : null,
+            outputLength,
+          };
+        }),
       },
     };
+  },
+
+  'GET /shootout': async ({ cfg }) => {
+    const { skills } = loadSkills(cfg);
+    const store = getStore(dataDir(cfg));
+    const providers = await providerHealth(cfg);
+    return {
+      html: ui.pageShootout({
+        skills,
+        providers,
+        defaultProvider: cfg.defaultProvider,
+        history: store.listComparisons(15),
+      }),
+    };
+  },
+
+  'POST /api/shootout': async ({ cfg, body }) => {
+    const args = LabRunSchema.parse(body ?? {});
+    const providerIds = [...new Set(args.providerIds)];
+    if (providerIds.length < 2) return { status: 400, json: { error: 'Pick at least two providers to compare.' } };
+    const comparisonId = crypto.randomUUID();
+    const runs: Array<{ providerId: string; runId: string }> = [];
+    for (const providerId of providerIds) {
+      const result = startLabRun(cfg, {
+        skillId: args.skillId,
+        providerId,
+        inputText: args.inputText,
+        model: args.model,
+        comparisonId,
+        mode: 'shootout',
+      });
+      if ('error' in result) return { status: 400, json: result };
+      runs.push({ providerId, runId: result.runId });
+    }
+    getStore(dataDir(cfg)).audit('shootout.started', { comparisonId, skillId: args.skillId, providers: providerIds });
+    return { status: 202, json: { comparisonId, runs } };
   },
 
   'POST /api/lab/prefs': async ({ cfg, body }) => {

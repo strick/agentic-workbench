@@ -316,33 +316,48 @@ export async function runWorkflow(cfg: Config, args: WorkflowRunArgs): Promise<W
 // provenance, but artifacts always land in data/lab-outputs (never in the real
 // output folders) and lab outputs never appear as workflow source files.
 
-function labTarget(skill: Skill): RunTarget {
+/** Lab-style runs come in two flavors with separate sandbox folders. */
+const LAB_MODES = {
+  'skill-lab': { subdir: 'lab-outputs', sourceRef: 'Skill Lab sample input' },
+  shootout: { subdir: 'shootouts', sourceRef: 'Provider shootout input' },
+} as const;
+export type LabMode = keyof typeof LAB_MODES;
+
+function labTarget(skill: Skill, mode: LabMode): RunTarget {
   const type = skill.kind && skill.kind !== 'other' ? skill.kind : 'lab-test';
   return {
-    id: 'skill-lab',
+    id: mode,
     outputType: type,
-    destination: { fallbackSubdir: 'lab-outputs' },
-    filenamePattern: `{label}-lab-${skill.id.slice(0, 8)}.md`,
+    destination: { fallbackSubdir: LAB_MODES[mode].subdir },
+    filenamePattern: `{label}-${mode === 'shootout' ? 'shootout' : 'lab'}-${skill.id.slice(0, 8)}.md`,
   };
 }
 
-export type LabRunArgs = { skillId: string; providerId: string; inputText: string; model?: string; comparisonId?: string };
+export type LabRunArgs = {
+  skillId: string;
+  providerId: string;
+  inputText: string;
+  model?: string;
+  comparisonId?: string;
+  mode?: LabMode;
+};
 
 export function startLabRun(cfg: Config, args: LabRunArgs): { runId: string } | { error: string } {
   const skill = findSkill(cfg, args.skillId);
   if (!skill) return { error: `Skill not found: ${args.skillId}` };
   const inputText = args.inputText.trim();
   if (!inputText) return { error: 'No sample input provided.' };
+  const mode: LabMode = args.mode ?? 'skill-lab';
   const { runId } = executeWorkflow({
     cfg,
-    def: labTarget(skill),
+    def: labTarget(skill, mode),
     skill,
     providerId: args.providerId,
-    inputSource: 'skill-lab',
+    inputSource: mode,
     inputText,
     inputFiles: [],
     label: new Date().toISOString().slice(0, 10),
-    sourceRef: 'Skill Lab sample input',
+    sourceRef: LAB_MODES[mode].sourceRef,
     model: args.model,
     comparisonId: args.comparisonId,
   });
