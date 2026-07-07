@@ -1,0 +1,15 @@
+{
+  "name": "Weekly Director Report",
+  "skillKind": "weekly-report",
+  "requiredSections": [
+    "Executive Summary",
+    "Strategic Progress",
+    "Delivery Evidence",
+    "Decisions / Alignment Needed",
+    "Risks / Gaps / Tradeoffs",
+    "Next Week Focus"
+  ],
+  "forbiddenPatterns": [],
+  "tonePatterns": ["\\btodo\\b", "\\bgonna\\b", "\\bkinda\\b", "^\\s*-\\s*fix(ed)? bug"],
+  "traceabilityThreshold": 0.4
+}

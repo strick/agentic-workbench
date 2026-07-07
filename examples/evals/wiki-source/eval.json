@@ -1,0 +1,21 @@
+{
+  "name": "Wiki Source (sanitization)",
+  "skillKind": "wiki-source",
+  "requiredSections": [
+    "Summary",
+    "Major Updates",
+    "Decisions",
+    "Open Questions",
+    "Source Notes Reviewed",
+    "Excluded Material"
+  ],
+  "forbiddenPatterns": [
+    "\\bBob\\b",
+    "\\bPriya\\b",
+    "\\bsalary\\b",
+    "\\$\\d",
+    "\\bvendor negotiation\\b"
+  ],
+  "tonePatterns": [],
+  "traceabilityThreshold": 0.3
+}

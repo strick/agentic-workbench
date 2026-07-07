@@ -364,6 +364,37 @@ export function startLabRun(cfg: Config, args: LabRunArgs): { runId: string } | 
   return { runId };
 }
 
+// --- Eval case runs -------------------------------------------------------------
+// Same engine, sandboxed to data/eval-outputs; awaited to completion because the
+// eval checks need the artifact content.
+
+export async function runEvalCase(
+  cfg: Config,
+  args: { skill: Skill; providerId: string; inputText: string; model?: string; suiteId: string; caseId: string },
+): Promise<WorkflowResult> {
+  const { skill } = args;
+  const target: RunTarget = {
+    id: 'eval',
+    outputType: skill.kind && skill.kind !== 'other' ? skill.kind : 'eval-output',
+    destination: { fallbackSubdir: 'eval-outputs' },
+    filenamePattern: `{label}-eval-${args.suiteId}-${args.caseId}.md`,
+  };
+  return executeWorkflow({
+    cfg,
+    def: target,
+    skill,
+    providerId: args.providerId,
+    inputSource: 'eval',
+    inputText: args.inputText,
+    // Also passed as a file so file-driven skills (weekly report, wiki source)
+    // see the fixture the same way they'd see selected source files.
+    inputFiles: [{ name: `input-${args.caseId}.md`, path: '', content: args.inputText }],
+    label: new Date().toISOString().slice(0, 10),
+    sourceRef: `Eval suite ${args.suiteId}, case ${args.caseId}`,
+    model: args.model,
+  }).promise;
+}
+
 // --- Inbox -------------------------------------------------------------------
 export function saveInboxNote(cfg: Config, text: string): { path: string; name: string } {
   const inboxDir = path.join(dataDir(cfg), 'inbox');

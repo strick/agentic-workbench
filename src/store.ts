@@ -67,6 +67,23 @@ export type RunScore = {
 
 export type SkillVersionRow = { id: string; skill_id: string; hash: string; seen_at: string };
 
+export type EvalRunRecord = {
+  id: string;
+  suite_id: string;
+  case_id: string;
+  skill_id: string;
+  skill_hash: string;
+  provider_id: string;
+  model: string;
+  run_id: string;
+  output_hash: string;
+  artifact_path: string;
+  results: string; // JSON CheckResult[]
+  passed: number;
+  failed: number;
+  created_at: string;
+};
+
 export type ApprovalRecord = {
   id: string;
   action: string; // 'obsidian-write' | 'git-commit' | future action types
@@ -128,6 +145,11 @@ CREATE TABLE IF NOT EXISTS golden_examples (
 CREATE TABLE IF NOT EXISTS run_scores (
   id TEXT PRIMARY KEY, run_id TEXT, skill_id TEXT, score TEXT, note TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS eval_runs (
+  id TEXT PRIMARY KEY, suite_id TEXT, case_id TEXT, skill_id TEXT, skill_hash TEXT,
+  provider_id TEXT, model TEXT, run_id TEXT, output_hash TEXT, artifact_path TEXT,
+  results TEXT, passed INTEGER, failed INTEGER, created_at TEXT
+);
 `;
 
 const JSON_TABLES = [
@@ -142,6 +164,7 @@ const JSON_TABLES = [
   'skill_prefs',
   'golden_examples',
   'run_scores',
+  'eval_runs',
 ] as const;
 type TableName = (typeof JSON_TABLES)[number];
 
@@ -526,6 +549,29 @@ export class Store {
       })
       .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
       .slice(0, limit);
+  }
+
+  // --- Evals -----------------------------------------------------------------
+  addEvalRun(e: Omit<EvalRunRecord, 'id' | 'created_at'>): EvalRunRecord {
+    const full: EvalRunRecord = { ...e, id: crypto.randomUUID(), created_at: now() };
+    this.insert('eval_runs', { ...full });
+    return full;
+  }
+
+  listEvalRuns(limit = 200): EvalRunRecord[] {
+    return (this.selectAll('eval_runs') as unknown as EvalRunRecord[])
+      .map((e) => ({ ...e, passed: Number(e.passed ?? 0), failed: Number(e.failed ?? 0) }))
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+      .slice(0, limit);
+  }
+
+  /** Most recent eval of the same suite/case/skill/provider — the regression baseline. */
+  lastEvalRun(suiteId: string, caseId: string, skillId: string, providerId: string): EvalRunRecord | null {
+    return (
+      this.listEvalRuns(10_000).find(
+        (e) => e.suite_id === suiteId && e.case_id === caseId && e.skill_id === skillId && e.provider_id === providerId,
+      ) ?? null
+    );
   }
 
   listRunsByComparison(comparisonId: string): RunRecord[] {

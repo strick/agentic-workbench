@@ -127,6 +127,16 @@ decision/risk extraction, ADRs, review packets, backlog breakdown, Microsoft
 alignment review, talk tracks, canon updates. Future project profiles can
 declare their own bundles.
 
+## Evals
+
+`evals.ts` discovers fixture suites (`examples/evals/*` + `<dataDir>/evals/*`),
+runs each case through the normal engine (sandboxed to `data/eval-outputs`),
+and applies six deterministic checks: required sections, leakage patterns,
+token-overlap source traceability, tone patterns, must-contain claims, and a
+regression diff (output hash + line similarity) against the last eval of the
+same suite/case/skill/provider stored in `eval_runs`. Skill hash is recorded
+per eval so prompt-version regressions are attributable.
+
 ## Provider Shootout
 
 `/shootout` launches the same skill + input across ≥2 providers concurrently

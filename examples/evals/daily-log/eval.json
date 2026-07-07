@@ -1,0 +1,14 @@
+{
+  "name": "Daily Work Log",
+  "skillKind": "daily-log",
+  "requiredSections": [
+    "Executive Summary",
+    "Work Completed",
+    "Decisions",
+    "Risks / Blockers",
+    "Follow-ups"
+  ],
+  "forbiddenPatterns": ["\\bconfidential\\b", "\\$\\d"],
+  "tonePatterns": [],
+  "traceabilityThreshold": 0.4
+}
