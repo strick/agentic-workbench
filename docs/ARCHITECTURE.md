@@ -31,9 +31,10 @@ src/
   store.ts           SQLite/JSON metadata store: runs, artifacts, skills, audit, approvals
   skills.ts          recursive skill scan, tolerant frontmatter parse, sha256 content hash
   generate.ts        deterministic markdown generators (mock provider's engine)
-  providers/index.ts AgentProvider interface, MockProvider, ClaudeCli/CopilotCli stubs
-  workflows.ts       daily-log / weekly-report / wiki-source orchestration + run records
-  ui.ts              layout, pages (dashboard, settings, skills, inbox, weekly, wiki, runs, artifacts)
+  providers/index.ts AgentProvider interface, MockProvider, ClaudeCli/CopilotCli adapters
+  workflowDefs.ts    the workflow model + registry of built-in workflow templates
+  workflows.ts       generic workflow engine: input resolution, run records, artifact writes
+  ui.ts              layout, pages (dashboard, settings, skills, workflows, runs, artifacts)
   server.ts          http plumbing, routes, JSON API, error handling
 ```
 
@@ -47,6 +48,7 @@ Bad values are dropped individually — a corrupt config never prevents startup.
 
 | Entity | Where | Notes |
 |---|---|---|
+| WorkflowDef | code (`workflowDefs.ts` registry) | Skill kind + input source + output type + destination + approval rule; the original three flows are built-in templates |
 | Skill / SkillVersion | filesystem is source of truth; sightings + hash history in DB | id = hash(source+path); version = distinct content hash |
 | AgentProvider | code + health snapshots in DB | `mock`, `claude-cli`, `copilot-cli` |
 | Run | DB | full provenance: skill path + hash, provider, input, output, status, timestamps, error |
@@ -72,6 +74,19 @@ interface AgentProvider {
 **input text/files**, a date/week label, and per-run **provider options** (`model`).
 Orchestration, artifact writing, and run tracking live in `workflows.ts` regardless of
 provider — providers only turn a request into markdown.
+
+## Workflow engine
+
+`workflowDefs.ts` defines the general model — `WorkflowDef = skill kind + input
+source + output type + destination + approval rule` — and a registry of built-in
+templates (daily log, weekly report, wiki source, canon update, ADR, review
+packet, planning brief, 1:1 prep, output QA). `workflows.ts` is a single generic
+engine: it resolves the input per the def (pasted text, saved inbox note, and/or
+source files restricted to app-enumerated listings), labels the run by date or
+ISO week, executes the provider, and writes the artifact to the def's
+destination (a configured folder for the original three types, `data/<subdir>`
+for the rest). The run page UI is generated from the def, so adding a workflow
+is one registry entry plus (optionally) an example skill.
 
 - **MockProvider** — deterministic keyword-based extractors in `generate.ts`. Same input
   + same skill ⇒ byte-identical output. Default provider; keeps everything offline-testable.

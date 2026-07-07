@@ -101,21 +101,21 @@ export function checkAllPaths(cfg: Config): PathCheck[] {
 }
 
 /**
- * Effective output directory for an artifact type. Uses the configured dir
- * only when it exists and is writable; otherwise the local data fallback.
+ * Effective output directory for a workflow destination: the configured
+ * folder when one applies and is writable, otherwise a subfolder of the
+ * local data dir named by the destination.
  */
-export function effectiveOutputDir(
+export function workflowOutputDir(
   cfg: Config,
-  kind: 'dailyLogDir' | 'weeklyReportDir' | 'wikiSourceDir' | 'inboxDir',
+  dest: { configKey?: 'dailyLogDir' | 'weeklyReportDir' | 'wikiSourceDir'; fallbackSubdir: string },
 ): { dir: string; usedFallback: boolean } {
-  const fallbacks = fallbackDirs(cfg);
-  if (kind !== 'inboxDir') {
-    const configured = resolveConfigPath(String(cfg[kind] ?? ''));
+  if (dest.configKey) {
+    const configured = resolveConfigPath(String(cfg[dest.configKey] ?? ''));
     if (configured && checkDir(configured).status === 'writable') {
       return { dir: configured, usedFallback: false };
     }
   }
-  const fb = fallbacks[kind]!;
+  const fb = path.join(dataDir(cfg), dest.fallbackSubdir);
   ensureDir(fb);
   return { dir: fb, usedFallback: true };
 }

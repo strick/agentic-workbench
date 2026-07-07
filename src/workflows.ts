@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { dataDir, type Config } from './config.ts';
-import { effectiveOutputDir, listMarkdownFiles, safeWriteFile } from './paths.ts';
+import { listMarkdownFiles, safeWriteFile, workflowOutputDir } from './paths.ts';
 import { findSkill, type Skill } from './skills.ts';
-import { composePrompt, getProvider, type ArtifactType, type RunRequest } from './providers/index.ts';
+import { composePrompt, getProvider, type RunRequest } from './providers/index.ts';
 import { getStore, type RunRecord } from './store.ts';
 import { createRunStream } from './runStream.ts';
+import { getWorkflow, workflowsByOutputType, type WorkflowDef } from './workflowDefs.ts';
 
 export type WorkflowResult = {
   runId: string;
@@ -16,26 +17,19 @@ export type WorkflowResult = {
   error?: string;
 };
 
-const OUTPUT_DIR_KEY: Record<ArtifactType, 'dailyLogDir' | 'weeklyReportDir' | 'wikiSourceDir'> = {
-  'daily-log': 'dailyLogDir',
-  'weekly-report': 'weeklyReportDir',
-  'wiki-source': 'wikiSourceDir',
-};
-
 function executeWorkflow(args: {
   cfg: Config;
+  def: WorkflowDef;
   skill: Skill;
   providerId: string;
-  artifactType: ArtifactType;
   inputSource: string;
   inputText: string;
   inputFiles: Array<{ name: string; path: string; content: string }>;
-  date: string;
-  filename: string;
+  label: string;
   sourceRef: string;
   model?: string;
 }): { runId: string; promise: Promise<WorkflowResult> } {
-  const { cfg, skill, providerId, artifactType } = args;
+  const { cfg, def, skill, providerId } = args;
   const store = getStore(dataDir(cfg));
   const provider = getProvider(cfg, providerId);
   const runId = crypto.randomUUID();
@@ -43,10 +37,10 @@ function executeWorkflow(args: {
   const stream = createRunStream(runId);
   const req: RunRequest = {
     skill,
-    artifactType,
+    artifactType: def.outputType,
     inputText: args.inputText,
     inputFiles: args.inputFiles.map((f) => ({ name: f.name, content: f.content })),
-    date: args.date,
+    date: args.label,
     sourceRef: args.sourceRef,
     options: { model: args.model || undefined },
     onChunk: (line) => stream.push(line),
@@ -64,7 +58,7 @@ function executeWorkflow(args: {
     input_text: args.inputText,
     input_files: args.inputFiles.map((f) => f.path),
     output_artifact_path: '',
-    artifact_type: artifactType,
+    artifact_type: def.outputType,
     status: 'running',
     error: '',
     provider_command: '',
@@ -76,8 +70,9 @@ function executeWorkflow(args: {
     prompt,
   });
   store.upsertSkillSighting(skill);
-  store.audit('run.started', { runId: run.id, skill: skill.name, provider: provider.id, artifactType });
+  store.audit('run.started', { runId: run.id, workflow: def.id, skill: skill.name, provider: provider.id, artifactType: def.outputType });
 
+  const filename = def.filenamePattern.replaceAll('{label}', args.label);
   const promise = provider
     .runSkill(req)
     .then((result) => {
@@ -86,8 +81,8 @@ function executeWorkflow(args: {
         store.audit('run.failed', { runId: run.id, error: result.error, command: result.commandLine ?? '' });
         return { runId: run.id, status: 'error' as const, error: result.error };
       }
-      const { dir, usedFallback } = effectiveOutputDir(cfg, OUTPUT_DIR_KEY[artifactType]);
-      const artifactPath = safeWriteFile(cfg, dir, args.filename, result.output);
+      const { dir, usedFallback } = workflowOutputDir(cfg, def.destination);
+      const artifactPath = safeWriteFile(cfg, dir, filename, result.output);
       store.completeRun(run.id, {
         output_artifact_path: artifactPath,
         provider_command: result.commandLine,
@@ -99,7 +94,7 @@ function executeWorkflow(args: {
       });
       store.addArtifact({
         run_id: run.id,
-        type: artifactType,
+        type: def.outputType,
         path: artifactPath,
         title: path.basename(artifactPath),
       });
@@ -118,89 +113,8 @@ function executeWorkflow(args: {
   return { runId: run.id, promise };
 }
 
-// --- Workflow 1: Daily Work Log --------------------------------------------
-type DailyLogArgs = { noteText?: string; inboxFile?: string; skillId: string; date?: string };
-type ResolvedDailyLogInput = {
-  skill: Skill;
-  inputText: string;
-  inputSource: string;
-  sourceRef: string;
-  inputFiles: Array<{ name: string; path: string; content: string }>;
-  date: string;
-};
-
-function resolveDailyLogInput(cfg: Config, args: DailyLogArgs): ResolvedDailyLogInput | { error: string } {
-  const skill = findSkill(cfg, args.skillId);
-  if (!skill) return { error: `Skill not found: ${args.skillId}` };
-  let inputText = (args.noteText ?? '').trim();
-  let inputSource = 'pasted';
-  let sourceRef = 'Pasted dictated notes';
-  const inputFiles: Array<{ name: string; path: string; content: string }> = [];
-  if (!inputText && args.inboxFile) {
-    const inboxDir = path.join(dataDir(cfg), 'inbox');
-    const target = path.resolve(inboxDir, path.basename(args.inboxFile));
-    try {
-      inputText = fs.readFileSync(target, 'utf8').trim();
-    } catch {
-      return { error: `Inbox file not readable: ${args.inboxFile}` };
-    }
-    inputSource = 'inbox-file';
-    sourceRef = `Inbox file: ${path.basename(target)}`;
-    inputFiles.push({ name: path.basename(target), path: target, content: inputText });
-  }
-  if (!inputText) return { error: 'No input notes provided.' };
-  const date = args.date || new Date().toISOString().slice(0, 10);
-  return { skill, inputText, inputSource, sourceRef, inputFiles, date };
-}
-
-export async function runDailyLog(
-  cfg: Config,
-  args: { noteText?: string; inboxFile?: string; skillId: string; providerId: string; date?: string; model?: string },
-): Promise<WorkflowResult | { error: string }> {
-  const resolved = resolveDailyLogInput(cfg, args);
-  if ('error' in resolved) return resolved;
-  const { skill, inputText, inputSource, sourceRef, inputFiles, date } = resolved;
-  return executeWorkflow({
-    cfg,
-    skill,
-    providerId: args.providerId,
-    artifactType: 'daily-log',
-    inputSource,
-    inputText,
-    inputFiles,
-    date,
-    filename: `${date}-daily-log.md`,
-    sourceRef,
-    model: args.model,
-  }).promise;
-}
-
-/** Starts a daily-log run without waiting for it to finish; the caller watches the run's live stream / polls the run record for completion. */
-export function startDailyLog(
-  cfg: Config,
-  args: { noteText?: string; inboxFile?: string; skillId: string; providerId: string; date?: string; model?: string },
-): { runId: string } | { error: string } {
-  const resolved = resolveDailyLogInput(cfg, args);
-  if ('error' in resolved) return resolved;
-  const { skill, inputText, inputSource, sourceRef, inputFiles, date } = resolved;
-  const { runId } = executeWorkflow({
-    cfg,
-    skill,
-    providerId: args.providerId,
-    artifactType: 'daily-log',
-    inputSource,
-    inputText,
-    inputFiles,
-    date,
-    filename: `${date}-daily-log.md`,
-    sourceRef,
-    model: args.model,
-  });
-  return { runId };
-}
-
-// --- Daily-log discovery / week grouping ------------------------------------
-export type DailyLogFile = { name: string; path: string; date: string; week: string };
+// --- Source-file discovery ----------------------------------------------------
+export type SourceFile = { name: string; path: string; type: string; date: string; week: string };
 
 export function isoWeekOf(dateStr: string): string {
   const d = new Date(`${dateStr}T00:00:00Z`);
@@ -212,44 +126,43 @@ export function isoWeekOf(dateStr: string): string {
   return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
-/** Daily logs from both the configured dir and the local fallback dir. */
-export function listDailyLogs(cfg: Config): DailyLogFile[] {
+/**
+ * All directories where artifacts of an output type may live: every matching
+ * workflow's configured destination plus its local data fallback.
+ */
+function outputDirsForType(cfg: Config, type: string): string[] {
   const dirs = new Set<string>();
-  const { dir } = effectiveOutputDir(cfg, 'dailyLogDir');
-  dirs.add(dir);
-  dirs.add(path.join(dataDir(cfg), 'daily-logs'));
-  const out: DailyLogFile[] = [];
-  const seen = new Set<string>();
-  for (const d of dirs) {
-    for (const f of listMarkdownFiles(d)) {
-      if (seen.has(f.path)) continue;
-      seen.add(f.path);
-      const m = f.name.match(/^(\d{4}-\d{2}-\d{2})/);
-      const date = m ? m[1] : '';
-      out.push({ name: f.name, path: f.path, date, week: date ? isoWeekOf(date) : '' });
-    }
+  for (const def of workflowsByOutputType(type)) {
+    const { dir } = workflowOutputDir(cfg, def.destination);
+    dirs.add(dir);
+    dirs.add(path.join(dataDir(cfg), def.destination.fallbackSubdir));
   }
-  return out.sort((a, b) => b.name.localeCompare(a.name));
+  return [...dirs];
 }
 
-export function listWeeklyReports(cfg: Config): Array<{ name: string; path: string }> {
-  const dirs = new Set<string>();
-  dirs.add(effectiveOutputDir(cfg, 'weeklyReportDir').dir);
-  dirs.add(path.join(dataDir(cfg), 'weekly-reports'));
-  const out: Array<{ name: string; path: string }> = [];
+/** Markdown files of the given output types, deduplicated, newest name first. */
+export function listSourceFiles(cfg: Config, types: string[]): SourceFile[] {
+  const out: SourceFile[] = [];
   const seen = new Set<string>();
-  for (const d of dirs) {
-    for (const f of listMarkdownFiles(d)) {
-      if (!seen.has(f.path)) {
+  for (const type of types) {
+    for (const d of outputDirsForType(cfg, type)) {
+      for (const f of listMarkdownFiles(d)) {
+        if (seen.has(f.path)) continue;
         seen.add(f.path);
-        out.push({ name: f.name, path: f.path });
+        const m = f.name.match(/^(\d{4}-\d{2}-\d{2})/);
+        const date = m ? m[1] : '';
+        out.push({ name: f.name, path: f.path, type, date, week: date ? isoWeekOf(date) : '' });
       }
     }
   }
   return out.sort((a, b) => b.name.localeCompare(a.name));
 }
 
-function readInputFiles(paths: string[], allowed: DailyLogFile[] | Array<{ name: string; path: string }>) {
+export function listDailyLogs(cfg: Config): SourceFile[] {
+  return listSourceFiles(cfg, ['daily-log']);
+}
+
+function readInputFiles(paths: string[], allowed: SourceFile[]) {
   const allowedMap = new Map(allowed.map((f) => [f.path, f.name]));
   const files: Array<{ name: string; path: string; content: string }> = [];
   for (const p of paths) {
@@ -264,53 +177,130 @@ function readInputFiles(paths: string[], allowed: DailyLogFile[] | Array<{ name:
   return files;
 }
 
-// --- Workflow 2: Weekly Director Report ------------------------------------
-export async function runWeeklyReport(
-  cfg: Config,
-  args: { week: string; files: string[]; skillId: string; providerId: string; model?: string },
-): Promise<WorkflowResult | { error: string }> {
+// --- Generic workflow runner ---------------------------------------------------
+export type WorkflowRunArgs = {
+  workflowId: string;
+  skillId: string;
+  providerId: string;
+  noteText?: string;
+  inboxFile?: string;
+  files?: string[];
+  /** Date (YYYY-MM-DD) or week (YYYY-Www) label; defaults derived when blank. */
+  label?: string;
+  model?: string;
+};
+
+type ResolvedInput = {
+  def: WorkflowDef;
+  skill: Skill;
+  inputText: string;
+  inputSource: string;
+  sourceRef: string;
+  inputFiles: Array<{ name: string; path: string; content: string }>;
+  label: string;
+};
+
+function resolveWorkflowInput(cfg: Config, args: WorkflowRunArgs): ResolvedInput | { error: string } {
+  const def = getWorkflow(args.workflowId);
+  if (!def) return { error: `Unknown workflow: ${args.workflowId}` };
   const skill = findSkill(cfg, args.skillId);
   if (!skill) return { error: `Skill not found: ${args.skillId}` };
-  const files = readInputFiles(args.files, listDailyLogs(cfg));
-  if (!files.length) return { error: 'No readable daily logs selected.' };
-  const week = args.week || files.map((f) => f.name.match(/^(\d{4}-\d{2}-\d{2})/)?.[1]).filter(Boolean).map((d) => isoWeekOf(d!))[0] || 'unknown-week';
-  return executeWorkflow({
-    cfg,
-    skill,
-    providerId: args.providerId,
-    artifactType: 'weekly-report',
-    inputSource: 'daily-logs',
-    inputText: files.map((f) => `<!-- ${f.name} -->\n${f.content}`).join('\n\n'),
-    inputFiles: files,
-    date: week,
-    filename: `${week}-weekly-report.md`,
-    sourceRef: `${files.length} daily logs`,
-    model: args.model,
-  }).promise;
+
+  const acceptsText = def.inputSource.kind === 'text' || def.inputSource.kind === 'text-or-files';
+  const acceptsFiles = def.inputSource.kind === 'files' || def.inputSource.kind === 'text-or-files';
+
+  let pastedText = acceptsText ? (args.noteText ?? '').trim() : '';
+  let inputSource = 'pasted';
+  let sourceRefParts: string[] = [];
+  const inputFiles: Array<{ name: string; path: string; content: string }> = [];
+
+  // Saved inbox note as the text input (daily-log style).
+  if (acceptsText && !pastedText && args.inboxFile) {
+    const inboxDir = path.join(dataDir(cfg), 'inbox');
+    const target = path.resolve(inboxDir, path.basename(args.inboxFile));
+    try {
+      pastedText = fs.readFileSync(target, 'utf8').trim();
+    } catch {
+      return { error: `Inbox file not readable: ${args.inboxFile}` };
+    }
+    inputSource = 'inbox-file';
+    sourceRefParts.push(`Inbox file: ${path.basename(target)}`);
+    inputFiles.push({ name: path.basename(target), path: target, content: pastedText });
+  } else if (pastedText) {
+    sourceRefParts.push('Pasted notes');
+  }
+
+  if (acceptsFiles && args.files?.length) {
+    const allowed = listSourceFiles(cfg, def.inputSource.fileTypes);
+    const files = readInputFiles(args.files, allowed);
+    inputFiles.push(...files);
+    if (files.length) {
+      inputSource = pastedText ? 'pasted+files' : 'source-files';
+      sourceRefParts.push(`${files.length} source file(s)`);
+    }
+  }
+
+  const fileBlock = inputFiles
+    .filter((f) => f.content !== pastedText) // don't repeat an inbox note used as the text
+    .map((f) => `<!-- ${f.name} -->\n${f.content}`)
+    .join('\n\n');
+  const inputText = [pastedText, fileBlock].filter(Boolean).join('\n\n');
+  if (!inputText.trim()) {
+    return { error: acceptsFiles ? 'No input provided — paste notes and/or select source files.' : 'No input notes provided.' };
+  }
+
+  let label = (args.label ?? '').trim();
+  if (!label) {
+    if (def.dateMode === 'week') {
+      label =
+        inputFiles.map((f) => f.name.match(/^(\d{4}-\d{2}-\d{2})/)?.[1]).filter(Boolean).map((d) => isoWeekOf(d!))[0] ||
+        isoWeekOf(new Date().toISOString().slice(0, 10));
+    } else {
+      label = new Date().toISOString().slice(0, 10);
+    }
+  }
+
+  return { def, skill, inputText, inputSource, sourceRef: sourceRefParts.join(' + ') || 'Direct input', inputFiles, label };
 }
 
-// --- Workflow 3: Wiki Source Builder ----------------------------------------
-export async function runWikiSource(
-  cfg: Config,
-  args: { files: string[]; skillId: string; providerId: string; date?: string; model?: string },
-): Promise<WorkflowResult | { error: string }> {
-  const skill = findSkill(cfg, args.skillId);
-  if (!skill) return { error: `Skill not found: ${args.skillId}` };
-  const candidates = [...listDailyLogs(cfg), ...listWeeklyReports(cfg)];
-  const files = readInputFiles(args.files, candidates);
-  if (!files.length) return { error: 'No readable source notes selected.' };
-  const date = args.date || new Date().toISOString().slice(0, 10);
-  return executeWorkflow({
+/**
+ * Starts a workflow run without waiting for it to finish; the caller watches
+ * the run's live stream / polls the run record for completion.
+ */
+export function startWorkflowRun(cfg: Config, args: WorkflowRunArgs): { runId: string } | { error: string } {
+  const resolved = resolveWorkflowInput(cfg, args);
+  if ('error' in resolved) return resolved;
+  const { def, skill, inputText, inputSource, sourceRef, inputFiles, label } = resolved;
+  const { runId } = executeWorkflow({
     cfg,
+    def,
     skill,
     providerId: args.providerId,
-    artifactType: 'wiki-source',
-    inputSource: 'logs-and-reports',
-    inputText: files.map((f) => `<!-- ${f.name} -->\n${f.content}`).join('\n\n'),
-    inputFiles: files,
-    date,
-    filename: `${date}-wiki-source.md`,
-    sourceRef: `${files.length} source notes`,
+    inputSource,
+    inputText,
+    inputFiles,
+    label,
+    sourceRef,
+    model: args.model,
+  });
+  return { runId };
+}
+
+/** Runs a workflow to completion (used by non-interactive callers/tests). */
+export async function runWorkflow(cfg: Config, args: WorkflowRunArgs): Promise<WorkflowResult | { error: string }> {
+  const resolved = resolveWorkflowInput(cfg, args);
+  if ('error' in resolved) return resolved;
+  const { def, skill, inputText, inputSource, sourceRef, inputFiles, label } = resolved;
+  return executeWorkflow({
+    cfg,
+    def,
+    skill,
+    providerId: args.providerId,
+    inputSource,
+    inputText,
+    inputFiles,
+    label,
+    sourceRef,
     model: args.model,
   }).promise;
 }

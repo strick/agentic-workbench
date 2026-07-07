@@ -6,7 +6,8 @@ import type { PathCheck } from './paths.ts';
 import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
 import type { ArtifactRecord, RunRecord } from './store.ts';
-import type { DailyLogFile } from './workflows.ts';
+import type { SourceFile } from './workflows.ts';
+import { allOutputTypes, type WorkflowDef } from './workflowDefs.ts';
 
 export function esc(s: unknown): string {
   return String(s ?? '')
@@ -69,9 +70,7 @@ const NAV = [
   ['/', 'Dashboard'],
   ['/settings', 'Settings'],
   ['/skills', 'Skills'],
-  ['/inbox', 'Inbox'],
-  ['/weekly', 'Weekly Report'],
-  ['/wiki', 'Wiki Source'],
+  ['/workflows', 'Workflows'],
   ['/runs', 'Runs'],
   ['/artifacts', 'Artifacts'],
 ] as const;
@@ -185,9 +184,10 @@ export function pageDashboard(d: {
 ${setupBanner}
 <h2>Quick actions</h2>
 <div class="qa">
-  <a href="/inbox">📝 New Daily Log<span>Paste dictated notes, run a skill</span></a>
-  <a href="/weekly">📊 Generate Weekly Report<span>Synthesize a week of daily logs</span></a>
-  <a href="/wiki">📚 Generate Wiki Source<span>Sanitized canon source notes</span></a>
+  <a href="/workflow?id=daily-log">📝 New Daily Log<span>Paste dictated notes, run a skill</span></a>
+  <a href="/workflow?id=weekly-report">📊 Generate Weekly Report<span>Synthesize a week of daily logs</span></a>
+  <a href="/workflow?id=wiki-source">📚 Generate Wiki Source<span>Sanitized canon source notes</span></a>
+  <a href="/workflows">🧰 All Workflows<span>ADRs, review packets, 1:1 prep, and more</span></a>
 </div>
 <h2>Configured paths</h2>
 <div class="panel">${pathsTable(d.paths)}
@@ -281,55 +281,137 @@ row.style.display='';}catch(e){alert(e.message)}}
 </script>`);
 }
 
-export function pageInbox(d: { skills: Skill[]; defaultProvider: string; inboxNotes: Array<{ name: string; path: string }>; preselectSkill?: string }): string {
-  const notes = d.inboxNotes.length
-    ? d.inboxNotes
+const CATEGORY_LABELS: Record<WorkflowDef['category'], string> = {
+  core: 'Core work routine',
+  architecture: 'Architecture',
+  planning: 'Planning & people',
+  quality: 'Quality',
+};
+
+export function pageWorkflows(d: { workflows: WorkflowDef[] }): string {
+  const categories = [...new Set(d.workflows.map((w) => w.category))];
+  const sections = categories
+    .map((cat) => {
+      const rows = d.workflows
+        .filter((w) => w.category === cat)
         .map(
-          (n) => `<tr><td class="mono small">${esc(n.name)}</td>
-<td><button class="secondary" onclick="loadNote('${esc(n.name)}')">Load into editor</button></td></tr>`,
+          (w) => `<tr>
+<td><b>${esc(w.name)}</b><br><span class="dim small">${esc(w.description)}</span></td>
+<td class="small dim">${esc(w.inputSource.label)}</td>
+<td><span class="badge b-dim">${esc(w.outputType)}</span></td>
+<td><a href="/workflow?id=${esc(w.id)}"><button>Open</button></a></td></tr>`,
+        )
+        .join('');
+      return `<h2>${esc(CATEGORY_LABELS[cat])}</h2>
+<div class="panel"><table><tr><th>Workflow</th><th>Input</th><th>Output type</th><th></th></tr>${rows}</table></div>`;
+    })
+    .join('');
+  return layout('Workflows', '/workflows', `
+<h1>Workflows</h1>
+<p class="dim">Every workflow is <b>Skill + Input Source + Provider + Output Type + Destination + Approval Rule</b>.
+The original daily log, weekly report, and wiki source flows are built-in templates of the same model.</p>
+${sections}`);
+}
+
+export function pageWorkflowRun(d: {
+  def: WorkflowDef;
+  skills: Skill[];
+  defaultProvider: string;
+  files: SourceFile[];
+  inboxNotes: Array<{ name: string; path: string }>;
+  preselectSkill?: string;
+}): string {
+  const w = d.def;
+  const acceptsText = w.inputSource.kind === 'text' || w.inputSource.kind === 'text-or-files';
+  const acceptsFiles = w.inputSource.kind === 'files' || w.inputSource.kind === 'text-or-files';
+
+  const textBlock = acceptsText
+    ? `<label for="noteText">Input notes <span class="dim">(${esc(w.inputSource.label)})</span></label>
+<textarea id="noteText" placeholder="Paste your input here…"></textarea>`
+    : '';
+
+  const fileRows = d.files.length
+    ? d.files
+        .map(
+          (f) => `<tr><td><input type="checkbox" class="srcSel" value="${esc(f.path)}" data-week="${esc(f.week)}"></td>
+<td class="mono small">${esc(f.name)}</td><td class="dim small">${esc(f.type)}</td><td class="mono small dim">${esc(f.week || '')}</td><td class="mono small dim">${esc(f.path)}</td></tr>`,
         )
         .join('')
-    : '<tr><td colspan="2" class="dim">No saved inbox notes.</td></tr>';
-  return layout('Inbox', '/inbox', `
-<h1>Inbox — Daily Work Log</h1>
+    : '<tr><td colspan="5" class="dim">No source files found yet — generate some artifacts first.</td></tr>';
+  const filesBlock = acceptsFiles
+    ? `<h2>Source files</h2>
+<table><tr><th></th><th>File</th><th>Type</th><th>Week</th><th>Path</th></tr>${fileRows}</table>`
+    : '';
+
+  const weeks = [...new Set(d.files.map((f) => f.week).filter(Boolean))].sort().reverse();
+  const labelField =
+    w.dateMode === 'week'
+      ? `<div><label for="labelInp">Week (auto-selects matching files)</label>
+<select id="labelInp">${weeks.map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join('') || '<option value="">(no dated files found)</option>'}</select></div>`
+      : `<div><label for="labelInp">Date</label><input type="date" id="labelInp"></div>`;
+
+  const inboxBlock =
+    acceptsText && d.inboxNotes.length
+      ? `<h2>Saved inbox notes</h2>
+<div class="panel"><table>${d.inboxNotes
+          .map(
+            (n) => `<tr><td class="mono small">${esc(n.name)}</td>
+<td><button class="secondary" onclick="loadNote('${esc(n.name)}')">Load into editor</button></td></tr>`,
+          )
+          .join('')}</table></div>`
+      : '';
+
+  const saveNoteBtn = acceptsText ? `<button id="saveNoteBtn" class="secondary">Save note to inbox</button>` : '';
+
+  return layout(w.name, '/workflows', `
+<h1>${esc(w.name)}</h1>
+<p class="dim">${esc(w.description)} Output type <span class="badge b-dim">${esc(w.outputType)}</span> · approval rule: <span class="mono">${esc(w.approvalRule)}</span>.</p>
 <div class="panel">
-<label for="noteText">Raw dictated notes</label>
-<textarea id="noteText" placeholder="Paste your end-of-day dictated notes here…"></textarea>
+${textBlock}
 <div class="row">
-  <div><label for="logDate">Log date</label><input type="date" id="logDate"></div>
-  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'daily-log', d.preselectSkill)}</select></div>
+  ${labelField}
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, w.skillKind, d.preselectSkill)}</select></div>
   <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
   ${MODEL_FIELD}
 </div>
+${filesBlock}
 <div class="actions">
-  <button id="runBtn">Run Daily Work Log</button>
-  <button id="saveNoteBtn" class="secondary">Save note to inbox</button>
+  <button id="runBtn">Run ${esc(w.name)}</button>
+  ${saveNoteBtn}
 </div>
-<div id="inboxMsg" class="msg"></div>
+<div id="wfMsg" class="msg"></div>
 <label>Live model output <span class="dim">(raw provider stream, updates as the run executes)</span></label>
 <pre id="livePane" style="display:none;max-height:280px;overflow:auto"></pre>
 <pre id="outputPreview" style="display:none"></pre>
 </div>
-<h2>Saved inbox notes</h2>
-<div class="panel"><table>${notes}</table></div>
+${inboxBlock}
 <script>
 ${MODEL_JS}
-document.getElementById('logDate').value=new Date().toISOString().slice(0,10);
+const WEEK_MODE=${w.dateMode === 'week' ? 'true' : 'false'};
+if(!WEEK_MODE)document.getElementById('labelInp').value=new Date().toISOString().slice(0,10);
+if(WEEK_MODE){const sel=document.getElementById('labelInp');
+const selectWeek=()=>{document.querySelectorAll('.srcSel').forEach(c=>{c.checked=c.dataset.week===sel.value})};
+sel.onchange=selectWeek;selectWeek();}
 async function loadNote(name){try{const r=await api('/api/inbox/read?name='+encodeURIComponent(name));
-document.getElementById('noteText').value=r.text;msg('inboxMsg','Loaded '+name,true)}catch(e){msg('inboxMsg',e.message,false)}}
-document.getElementById('saveNoteBtn').onclick=async()=>{try{
+document.getElementById('noteText').value=r.text;msg('wfMsg','Loaded '+name,true)}catch(e){msg('wfMsg',e.message,false)}}
+const saveBtn=document.getElementById('saveNoteBtn');
+if(saveBtn)saveBtn.onclick=async()=>{try{
 const t=document.getElementById('noteText').value;if(!t.trim())throw new Error('Nothing to save.');
 const r=await api('/api/inbox',{method:'POST',body:JSON.stringify({text:t})});
-msg('inboxMsg','Saved to '+r.name+' — reload page to see it listed.',true)}catch(e){msg('inboxMsg',e.message,false)}};
+msg('wfMsg','Saved to '+r.name+' — reload page to see it listed.',true)}catch(e){msg('wfMsg',e.message,false)}};
 document.getElementById('runBtn').onclick=async()=>{
 const b=document.getElementById('runBtn');b.disabled=true;
 const live=document.getElementById('livePane');live.textContent='';live.style.display='';
 document.getElementById('outputPreview').style.display='none';
-msg('inboxMsg','Running…',true);
+msg('wfMsg','Running…',true);
 try{
-const body={noteText:document.getElementById('noteText').value,date:document.getElementById('logDate').value,
+const noteEl=document.getElementById('noteText');
+const body={workflowId:'${esc(w.id)}',
+noteText:noteEl?noteEl.value:'',
+files:[...document.querySelectorAll('.srcSel:checked')].map(c=>c.value),
+label:document.getElementById('labelInp').value,
 skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
-const r=await api('/api/run/daily',{method:'POST',body:JSON.stringify(body)});
+const r=await api('/api/run/workflow',{method:'POST',body:JSON.stringify(body)});
 const es=new EventSource('/api/runs/'+r.runId+'/stream');
 es.onmessage=(ev)=>{try{live.textContent+=JSON.parse(ev.data)+'\\n';live.scrollTop=live.scrollHeight}catch{}};
 es.addEventListener('done',async(ev)=>{
@@ -337,100 +419,15 @@ es.close();
 let result={};try{result=JSON.parse(ev.data)}catch{}
 if(result.status==='completed'){
 const link=document.createElement('a');link.href='/run?id='+result.runId;link.textContent='view run '+result.runId.slice(0,8);
-msg('inboxMsg','Daily log written to '+result.artifactPath+(result.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
+msg('wfMsg','Artifact written to '+result.artifactPath+(result.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
 try{const pv=await api('/api/artifacts/content?path='+encodeURIComponent(result.artifactPath));
 const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display=''}catch(e){}
 }else{
-msg('inboxMsg',result.error||'Run failed.',false);
+msg('wfMsg',result.error||'Run failed.',false);
 }
 b.disabled=false;
 });
-}catch(e){msg('inboxMsg',e.message,false);b.disabled=false}};
-</script>`);
-}
-
-export function pageWeekly(d: { skills: Skill[]; defaultProvider: string; logs: DailyLogFile[] }): string {
-  const weeks = [...new Set(d.logs.map((l) => l.week).filter(Boolean))].sort().reverse();
-  const weekOpts = weeks.map((w) => `<option value="${esc(w)}">${esc(w)}</option>`).join('') || '<option value="">(no dated logs found)</option>';
-  const logRows = d.logs.length
-    ? d.logs
-        .map(
-          (l) => `<tr><td><input type="checkbox" class="logSel" value="${esc(l.path)}" data-week="${esc(l.week)}"></td>
-<td class="mono small">${esc(l.name)}</td><td class="mono small dim">${esc(l.week || '?')}</td><td class="mono small dim">${esc(l.path)}</td></tr>`,
-        )
-        .join('')
-    : '<tr><td colspan="4" class="dim">No daily logs found yet — generate one from the Inbox first.</td></tr>';
-  return layout('Weekly Report', '/weekly', `
-<h1>Weekly Director Report</h1>
-<div class="panel">
-<div class="row">
-  <div><label for="weekSel">Week (auto-selects matching logs)</label><select id="weekSel">${weekOpts}</select></div>
-  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'weekly-report')}</select></div>
-  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
-  ${MODEL_FIELD}
-</div>
-<h2>Daily logs</h2>
-<table><tr><th></th><th>File</th><th>Week</th><th>Path</th></tr>${logRows}</table>
-<div class="actions"><button id="runBtn">Generate Weekly Report</button></div>
-<div id="wkMsg" class="msg"></div>
-<pre id="outputPreview" style="display:none"></pre>
-</div>
-<script>
-${MODEL_JS}
-function selectWeek(){const w=document.getElementById('weekSel').value;
-document.querySelectorAll('.logSel').forEach(c=>{c.checked=c.dataset.week===w})}
-document.getElementById('weekSel').onchange=selectWeek;selectWeek();
-document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
-const files=[...document.querySelectorAll('.logSel:checked')].map(c=>c.value);
-const body={week:document.getElementById('weekSel').value,files,
-skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
-const r=await api('/api/run/weekly',{method:'POST',body:JSON.stringify(body)});
-const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
-msg('wkMsg','Weekly report written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
-const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
-const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
-}catch(e){msg('wkMsg',e.message,false)}finally{b.disabled=false}};
-</script>`);
-}
-
-export function pageWiki(d: {
-  skills: Skill[];
-  defaultProvider: string;
-  logs: DailyLogFile[];
-  reports: Array<{ name: string; path: string }>;
-}): string {
-  const row = (name: string, p: string, kind: string) =>
-    `<tr><td><input type="checkbox" class="srcSel" value="${esc(p)}"></td>
-<td class="mono small">${esc(name)}</td><td class="dim small">${kind}</td><td class="mono small dim">${esc(p)}</td></tr>`;
-  const rows =
-    [...d.logs.map((l) => row(l.name, l.path, 'daily log')), ...d.reports.map((r) => row(r.name, r.path, 'weekly report'))].join('') ||
-    '<tr><td colspan="4" class="dim">No source notes found yet.</td></tr>';
-  return layout('Wiki Source', '/wiki', `
-<h1>Wiki Source Builder</h1>
-<p class="dim">Produces a <b>sanitized</b> source note for wiki/canon material. Draft only — it never edits wiki pages or Git repos.</p>
-<div class="panel">
-<div class="row">
-  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'wiki-source')}</select></div>
-  <div><label for="provSel">Provider</label><select id="provSel">${providerOptions(d.defaultProvider)}</select></div>
-  ${MODEL_FIELD}
-</div>
-<h2>Source notes (daily logs + weekly reports)</h2>
-<table><tr><th></th><th>File</th><th>Kind</th><th>Path</th></tr>${rows}</table>
-<div class="actions"><button id="runBtn">Generate Wiki Source</button></div>
-<div id="wikiMsg" class="msg"></div>
-<pre id="outputPreview" style="display:none"></pre>
-</div>
-<script>
-${MODEL_JS}
-document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
-const files=[...document.querySelectorAll('.srcSel:checked')].map(c=>c.value);
-const body={files,skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
-const r=await api('/api/run/wiki',{method:'POST',body:JSON.stringify(body)});
-const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
-msg('wikiMsg','Wiki source written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
-const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
-const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
-}catch(e){msg('wikiMsg',e.message,false)}finally{b.disabled=false}};
+}catch(e){msg('wfMsg',e.message,false);b.disabled=false}};
 </script>`);
 }
 
@@ -476,7 +473,7 @@ ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` 
 }
 
 export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; previewPath: string; previewContent: string }): string {
-  const types = ['', 'daily-log', 'weekly-report', 'wiki-source'];
+  const types = ['', ...allOutputTypes()];
   const filterSel = types
     .map((t) => `<option value="${t}"${t === d.filter ? ' selected' : ''}>${t || 'all types'}</option>`)
     .join('');

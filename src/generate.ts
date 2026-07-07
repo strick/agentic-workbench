@@ -158,6 +158,68 @@ export function genWeeklyReport(args: {
   ].join('\n');
 }
 
+/** Human title for an output type, e.g. 'review-packet' -> 'Review Packet'. */
+function typeTitle(outputType: string): string {
+  return outputType
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .replace(/\b(Adr|Qa)\b/g, (m) => m.toUpperCase());
+}
+
+/**
+ * Generic deterministic generator for workflow output types that don't have
+ * a dedicated generator above (ADRs, review packets, planning briefs, ...).
+ * Same keyword-extraction approach as genDailyLog, shaped into a neutral
+ * artifact structure that all generic workflows share.
+ */
+export function genGeneric(args: {
+  outputType: string;
+  label: string;
+  inputText: string;
+  sources: Array<{ name: string; content: string }>;
+  skill: Skill;
+  providerId: string;
+  sourceRef: string;
+}): string {
+  const { outputType, label, inputText, sources, skill, providerId, sourceRef } = args;
+  // inputText already includes selected file contents (the engine composes it
+  // that way for the provider prompt), so extract from it alone.
+  const lines = sentences(inputText);
+  const decisions = pick(lines, RE_DECISION);
+  const risks = pick(lines, RE_RISK);
+  const followups = pick(lines, RE_FOLLOWUP);
+  const classified = new Set([...decisions, ...risks, ...followups]);
+  const keyPoints = lines.filter((l) => !classified.has(l)).slice(0, 20);
+
+  return [
+    `# ${typeTitle(outputType)} — ${label}`,
+    '',
+    '## Summary',
+    lines.length
+      ? `Drafted from ${sources.length ? `${sources.length} source file(s)` : 'pasted notes'}: ` +
+        `${keyPoints.length} key points, ${decisions.length} decision item(s), ${risks.length} risk(s), ${followups.length} follow-up(s).`
+      : 'No substantive input captured.',
+    '',
+    '## Key Points',
+    bullets(keyPoints),
+    '',
+    '## Decisions',
+    bullets(decisions, '- _No decisions found in the input._'),
+    '',
+    '## Risks / Open Questions',
+    bullets(risks, '- _No risks or open questions found._'),
+    '',
+    '## Follow-ups / Actions',
+    bullets(followups, '- _No follow-ups found._'),
+    '',
+    '## Source Notes Used',
+    sources.length ? sources.map((s) => `- ${s.name}`).join('\n') : `- ${sourceRef}`,
+    '',
+    footer(skill, providerId),
+    '',
+  ].join('\n');
+}
+
 const RE_SENSITIVE = /\b(met with|talked to|spoke with|1:1|salary|budget|\$\d|vendor|hr\b|ping)\b/i;
 const RE_NAME_LIKE = /\b(?:with|from|to)\s+[A-Z][a-z]+\b/;
 
