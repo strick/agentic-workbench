@@ -40,9 +40,21 @@ src/
 
 ## Config precedence
 
-`local-config.json` (written by the Settings UI) → `.env.local` / `process.env` →
-schema defaults. Config is re-read per request, so saving settings applies immediately.
-Bad values are dropped individually — a corrupt config never prevents startup.
+Active profile overrides → `local-config.json` (written by the Settings UI) →
+`.env.local` / `process.env` → schema defaults. Config is re-read per request, so
+saving settings or switching profiles applies immediately. Bad values (including
+malformed profiles) are dropped individually — a corrupt config never prevents startup.
+
+## Project profiles
+
+`Profile` (zod-validated, stored under `profiles` in `local-config.json` with
+`activeProfile` naming the active one) bundles per-machine path overrides, a
+default provider, an `allowedWorkflows` allow-list (enforced at the API on run
+and page access, empty = all), and an `approvalActions` allow-list gating which
+external actions may even be proposed. `loadConfig()` overlays the active
+profile's non-empty values and tags their source as `profile`, so the whole
+engine — skills, providers, destinations, approvals — is profile-aware without
+any special-casing downstream.
 
 ## Core entities
 
@@ -184,7 +196,12 @@ runs on `comparison_id` — no extra tables.
 
 ## Possible next milestones
 
-1. Streaming run output to the UI (progress instead of a spinner for 120 s runs).
-2. Per-provider defaults in Settings (model, extra flags) on top of the per-run field.
-3. Side-by-side provider comparison for the same input (mock vs claude vs copilot).
-4. Approval-gated external writes (wiki/Git) using the existing `approvals` table.
+Shipped since the MVP: live run streaming, the general workflow engine, Skill
+Lab (versions/goldens/scores/prefs), provider shootout, Architecture Mode,
+approval-gated Obsidian/Git writes, fixture-based evals, the morning brief with
+watch mode, and project profiles. Candidates from here:
+
+1. Per-profile data dirs / run tagging so each profile's history is separable.
+2. LLM-assisted eval checks (rubric-as-judge) layered on the deterministic ones.
+3. More approval-gated actions: wiki-source PR drafts, email drafts, ADO items.
+4. Calendar/email read-only enrichment of the morning brief.

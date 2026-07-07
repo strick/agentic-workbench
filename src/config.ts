@@ -82,9 +82,49 @@ export function resolveConfigPath(p: string): string {
   return path.resolve(APP_ROOT, p);
 }
 
+// --- Project profiles ------------------------------------------------------------
+// A profile is a named bundle of machine-local overrides: paths, default
+// provider, which workflows are allowed, and which approval actions are
+// enabled. Profiles live in local-config.json (gitignored), so the same repo
+// clone carries different profiles on the personal PC and the work PC without
+// hardcoding paths anywhere.
+
+export const PROFILE_PATH_KEYS = [
+  'skillsDir',
+  'obsidianVaultDir',
+  'dailyLogDir',
+  'weeklyReportDir',
+  'wikiSourceDir',
+  'gitRepoDir',
+] as const;
+export type ProfilePathKey = (typeof PROFILE_PATH_KEYS)[number];
+
+export const ProfileSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,40}$/, 'Profile id: lowercase letters, digits, hyphens.'),
+  name: z.string().min(1).max(80),
+  description: z.string().max(300).default(''),
+  // Path overrides: blank = inherit the base config value.
+  skillsDir: z.string().default(''),
+  obsidianVaultDir: z.string().default(''),
+  dailyLogDir: z.string().default(''),
+  weeklyReportDir: z.string().default(''),
+  wikiSourceDir: z.string().default(''),
+  gitRepoDir: z.string().default(''),
+  /** '' = inherit base default provider. */
+  defaultProvider: z.union([ProviderIdSchema, z.literal('')]).default(''),
+  /** Workflow ids this profile may run. Empty = all workflows. */
+  allowedWorkflows: z.array(z.string()).default([]),
+  /** Approval action types this profile may propose/execute. */
+  approvalActions: z.array(z.enum(['obsidian-write', 'git-commit'])).default(['obsidian-write', 'git-commit']),
+});
+export type Profile = z.infer<typeof ProfileSchema>;
+
 export type LoadedConfig = Config & {
-  /** which layer supplied each key: default | env | local-config */
-  sources: Record<string, 'default' | 'env' | 'local-config'>;
+  /** which layer supplied each key: default | env | local-config | profile */
+  sources: Record<string, 'default' | 'env' | 'local-config' | 'profile'>;
+  profiles: Profile[];
+  activeProfileId: string;
+  activeProfile: Profile | null;
 };
 
 /**
@@ -127,7 +167,46 @@ export function loadConfig(): LoadedConfig {
   for (const k of Object.keys(ConfigSchema.shape)) {
     if (!(k in sources)) sources[k] = 'default';
   }
-  return { ...cfg, sources };
+
+  // Overlay the active profile (non-empty values only) on top of everything.
+  const { profiles, activeProfileId } = readProfiles(local);
+  const activeProfile = profiles.find((p) => p.id === activeProfileId) ?? null;
+  if (activeProfile) {
+    for (const key of PROFILE_PATH_KEYS) {
+      if (activeProfile[key]) {
+        cfg[key] = activeProfile[key];
+        sources[key] = 'profile';
+      }
+    }
+    if (activeProfile.defaultProvider) {
+      cfg.defaultProvider = activeProfile.defaultProvider;
+      sources.defaultProvider = 'profile';
+    }
+  }
+
+  return { ...cfg, sources, profiles, activeProfileId: activeProfile ? activeProfileId : '', activeProfile };
+}
+
+/** Profiles + active id straight from the local config file (never from env). */
+function readProfiles(local: Record<string, unknown>): { profiles: Profile[]; activeProfileId: string } {
+  const profiles: Profile[] = [];
+  if (Array.isArray(local.profiles)) {
+    for (const raw of local.profiles) {
+      const parsed = ProfileSchema.safeParse(raw);
+      if (parsed.success && !profiles.some((p) => p.id === parsed.data.id)) profiles.push(parsed.data);
+    }
+  }
+  const activeProfileId = typeof local.activeProfile === 'string' ? local.activeProfile : '';
+  return { profiles, activeProfileId };
+}
+
+/** Upsert/delete profiles and the active profile id in local-config.json. */
+export function saveProfiles(update: { profiles?: Profile[]; activeProfileId?: string }): LoadedConfig {
+  const current = readLocalConfigFile();
+  if (update.profiles !== undefined) current.profiles = update.profiles;
+  if (update.activeProfileId !== undefined) current.activeProfile = update.activeProfileId;
+  fs.writeFileSync(LOCAL_CONFIG_FILE, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return loadConfig();
 }
 
 /** Persist settings from the UI into local-config.json (gitignored). */

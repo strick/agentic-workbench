@@ -79,6 +79,23 @@ Example mapping (adjust to your machine — these are placeholders, nothing is h
 Each path is validated and shown as **writable / read-only / missing / unreadable /
 not-configured**. A missing path never crashes the app — outputs just fall back to `./data`.
 
+## Project Profiles
+
+The **Profiles** page manages named bundles of machine-local settings — e.g.
+*Work Notes*, *AI Architecture*, *Fable*, *Book*, *Zaxis*, *Grocery/Hermes*,
+*Trading Coach* (seedable examples). Each profile can set:
+
+- `skillsDir`, vault root, output folders, `gitRepoDir` (blank = inherit Settings)
+- `defaultProvider`
+- `allowedWorkflows` — the only workflows runnable while the profile is active
+  (enforced in the API, not just hidden in the UI)
+- `approvalActions` — which approval-gated actions the profile may propose
+
+Profiles live in `local-config.json` (gitignored), so the same repo clone
+carries different profiles on the personal PC and the work PC without
+hardcoding paths. The active profile's overrides win over Settings; deactivate
+to fall back to base config.
+
 ## Work PC setup
 
 1. Clone the repo (only source, docs, and examples come across — no notes, no paths).

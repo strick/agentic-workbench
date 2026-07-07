@@ -13,7 +13,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import { ConfigSchema, dataDir, loadConfig, saveLocalConfig, type LoadedConfig } from './config.ts';
+import { ConfigSchema, ProfileSchema, dataDir, loadConfig, saveLocalConfig, saveProfiles, type LoadedConfig, type Profile } from './config.ts';
 import { allowedReadRoots, checkAllPaths, isPathAllowed } from './paths.ts';
 import { loadSkills } from './skills.ts';
 import { getProviders } from './providers/index.ts';
@@ -22,7 +22,7 @@ import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkf
 import { executeApproval, proposeGitCommit, proposeObsidianWrite } from './actions.ts';
 import { listEvalSuites, runEvalSuite } from './evals.ts';
 import { latestBrief, writeBrief } from './brief.ts';
-import { ARCHITECTURE_MODE, allowedWorkflows, getWorkflow, modeWorkflows } from './workflowDefs.ts';
+import { ARCHITECTURE_MODE, WORKFLOWS, allowedWorkflows, getWorkflow, isWorkflowAllowed, modeWorkflows } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
 
@@ -138,6 +138,7 @@ const routes: Record<string, Handler> = {
         artifacts: store.listArtifacts().slice(0, 5),
         skillCount: skills.length,
         storeBackend: store.backend,
+        activeProfile: cfg.activeProfile,
       }),
     };
   },
@@ -170,7 +171,7 @@ const routes: Record<string, Handler> = {
 
   'GET /workflow': async ({ cfg, url }) => {
     const def = getWorkflow(url.searchParams.get('id') ?? '');
-    if (!def) return { redirect: '/workflows' };
+    if (!def || !isWorkflowAllowed(cfg, def.id)) return { redirect: '/workflows' };
     const { skills } = loadSkills(cfg);
     return {
       html: ui.pageWorkflowRun({
@@ -349,6 +350,53 @@ const routes: Record<string, Handler> = {
     return { json: { ok: true } };
   },
 
+  'GET /profiles': async ({ cfg }) => ({
+    html: ui.pageProfiles({
+      profiles: cfg.profiles,
+      activeProfileId: cfg.activeProfileId,
+      workflows: WORKFLOWS,
+    }),
+  }),
+
+  'GET /api/profiles': async ({ cfg }) => ({
+    json: { profiles: cfg.profiles, activeProfileId: cfg.activeProfileId },
+  }),
+
+  'POST /api/profiles': async ({ cfg, body }) => {
+    const profile = ProfileSchema.parse(body ?? {});
+    const rest = cfg.profiles.filter((p) => p.id !== profile.id);
+    saveProfiles({ profiles: [...rest, profile] });
+    getStore(dataDir(cfg)).audit('profile.saved', { id: profile.id, name: profile.name });
+    return { json: { ok: true } };
+  },
+
+  'POST /api/profiles/delete': async ({ cfg, body }) => {
+    const { id } = z.object({ id: z.string().min(1) }).parse(body ?? {});
+    saveProfiles({
+      profiles: cfg.profiles.filter((p) => p.id !== id),
+      activeProfileId: cfg.activeProfileId === id ? '' : cfg.activeProfileId,
+    });
+    getStore(dataDir(cfg)).audit('profile.deleted', { id });
+    return { json: { ok: true } };
+  },
+
+  'POST /api/profiles/activate': async ({ cfg, body }) => {
+    const { id } = z.object({ id: z.string().default('') }).parse(body ?? {});
+    if (id && !cfg.profiles.some((p) => p.id === id)) return { status: 404, json: { error: `No such profile: ${id}` } };
+    saveProfiles({ activeProfileId: id });
+    getStore(dataDir(cfg)).audit('profile.activated', { id: id || '(base config)' });
+    return { json: { ok: true } };
+  },
+
+  'POST /api/profiles/seed': async ({ cfg }) => {
+    const existing = new Set(cfg.profiles.map((p) => p.id));
+    const seeds = EXAMPLE_PROFILES.filter((p) => !existing.has(p.id));
+    if (!seeds.length) return { json: { ok: true, added: 0 } };
+    saveProfiles({ profiles: [...cfg.profiles, ...seeds] });
+    getStore(dataDir(cfg)).audit('profile.seeded', { added: seeds.map((p) => p.id) });
+    return { json: { ok: true, added: seeds.length } };
+  },
+
   'GET /brief': async ({ cfg }) => ({ html: ui.pageBrief({ latest: latestBrief(cfg) }) }),
 
   'POST /api/brief': async ({ cfg }) => {
@@ -393,6 +441,10 @@ const routes: Record<string, Handler> = {
 
   'POST /api/actions/propose': async ({ cfg, body }) => {
     const args = ProposeSchema.parse(body ?? {});
+    const allowedActions = cfg.activeProfile?.approvalActions ?? ['obsidian-write', 'git-commit'];
+    if (!allowedActions.includes(args.type)) {
+      return { status: 403, json: { error: `Action "${args.type}" is not allowed by the active profile.` } };
+    }
     const result =
       args.type === 'obsidian-write'
         ? proposeObsidianWrite(cfg, { artifactPath: args.artifactPath, subdir: args.subdir, filename: args.filename || undefined })
@@ -502,6 +554,9 @@ const routes: Record<string, Handler> = {
 
   'POST /api/run/workflow': async ({ cfg, body }) => {
     const args = WorkflowRunSchema.parse(body ?? {});
+    if (!isWorkflowAllowed(cfg, args.workflowId)) {
+      return { status: 403, json: { error: `Workflow "${args.workflowId}" is not allowed by the active profile.` } };
+    }
     const result = startWorkflowRun(cfg, args);
     if ('error' in result) return { status: 400, json: result };
     return { status: 202, json: result };
@@ -518,6 +573,49 @@ const routes: Record<string, Handler> = {
     json: { ok: true, store: getStore(dataDir(cfg)).backend, node: process.version },
   }),
 };
+
+// Example profiles seeded on demand from the Profiles page. Paths are left
+// blank on purpose — they're machine-specific and filled in per clone.
+const EXAMPLE_PROFILES: Profile[] = [
+  {
+    id: 'work-notes', name: 'Work Notes', description: 'Daily logs and weekly reports for the day job.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['daily-log', 'weekly-report', 'one-on-one-prep', 'sprint-planning'],
+    approvalActions: ['obsidian-write'],
+  },
+  {
+    id: 'ai-architecture', name: 'AI Architecture', description: 'Canon, ADRs, roadmap, review packets — the architecture artifact factory.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ARCHITECTURE_MODE.workflowIds.concat('wiki-source'),
+    approvalActions: ['obsidian-write', 'git-commit'],
+  },
+  {
+    id: 'fable', name: 'Fable', description: 'Generated docs, QA critique, consolidation of AI output.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['fable-output-qa', 'wiki-source', 'architecture-canon'],
+    approvalActions: ['obsidian-write'],
+  },
+  {
+    id: 'book', name: 'Book', description: 'Chapters, outline, tone review.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['daily-log', 'fable-output-qa'], approvalActions: ['obsidian-write', 'git-commit'],
+  },
+  {
+    id: 'zaxis', name: 'Zaxis', description: 'Pi survival assistant docs and checklists.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['daily-log', 'roadmap-to-backlog'], approvalActions: ['git-commit'],
+  },
+  {
+    id: 'grocery-hermes', name: 'Grocery/Hermes', description: 'Household automation notes.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['daily-log', 'sprint-planning'], approvalActions: [],
+  },
+  {
+    id: 'trading-coach', name: 'Trading Coach', description: 'Daily market notes, lessons learned.',
+    skillsDir: '', obsidianVaultDir: '', dailyLogDir: '', weeklyReportDir: '', wikiSourceDir: '', gitRepoDir: '',
+    defaultProvider: '', allowedWorkflows: ['daily-log', 'weekly-report'], approvalActions: [],
+  },
+];
 
 // Minimal fragment renderer for path validation results (reuses ui styles).
 function renderPathsFragment(paths: ReturnType<typeof checkAllPaths>): string {
