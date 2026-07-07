@@ -127,6 +127,14 @@ decision/risk extraction, ADRs, review packets, backlog breakdown, Microsoft
 alignment review, talk tracks, canon updates. Future project profiles can
 declare their own bundles.
 
+## Morning Brief
+
+`brief.ts` + `cli.ts` (`npm run brief` / `npm run watch`): deterministic
+section-extraction over recent daily logs, decision lists, and risk registers —
+no provider, works offline, safe to run unattended. Watch mode uses `fs.watch`
+on the note folders with a 2s debounce and skips rewrites when the brief
+content is unchanged. Served in the UI at `/brief`.
+
 ## Evals
 
 `evals.ts` discovers fixture suites (`examples/evals/*` + `<dataDir>/evals/*`),
