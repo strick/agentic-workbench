@@ -143,12 +143,15 @@ const MODEL_FIELD = `<div><label for="modelInp">Model <span class="dim">(optiona
 const MODEL_JS = `function modelVal(){return document.getElementById('modelInp').value.trim()}`;
 
 function runRows(runs: RunRecord[]): string {
-  if (!runs.length) return '<tr><td colspan="6" class="dim">No runs yet.</td></tr>';
+  if (!runs.length) return '<tr><td colspan="9" class="dim">No runs yet.</td></tr>';
   return runs
     .map(
       (r) => `<tr><td><a href="/run?id=${esc(r.id)}" class="mono">${esc(r.id.slice(0, 8))}</a></td>
 <td>${esc(r.artifact_type)}</td><td>${esc(r.skill_name)}</td><td class="mono small">${esc(r.provider_id)}</td>
-<td>${statusBadge(r.status)}</td><td class="small dim">${esc(r.created_at.slice(0, 19).replace('T', ' '))}</td></tr>`,
+<td class="mono small">${r.model_used ? esc(r.model_used) : '<span class="dim">—</span>'}</td>
+<td>${statusBadge(r.status)}</td><td class="small dim">${esc(r.created_at.slice(0, 19).replace('T', ' '))}</td>
+<td class="small">${r.cost_usd ? '$' + r.cost_usd.toFixed(4) : '<span class="dim">—</span>'}</td>
+<td class="small">${r.credits_used ? r.credits_used.toFixed(2) : '<span class="dim">—</span>'}</td></tr>`,
     )
     .join('');
 }
@@ -192,7 +195,7 @@ ${setupBanner}
 <h2>Providers</h2>
 <div class="panel"><table><tr><th>Provider</th><th>Health</th><th>Detail</th></tr>${providerRows(d.providers)}</table></div>
 <h2>Recent runs</h2>
-<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Status</th><th>Created</th></tr>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th>Cost</th><th>Credits</th></tr>
 ${runRows(d.runs)}</table></div>
 <h2>Latest artifacts</h2>
 <div class="panel"><table><tr><th>File</th><th>Type</th><th>Path</th><th></th></tr>${artifacts}</table></div>`);
@@ -303,6 +306,8 @@ export function pageInbox(d: { skills: Skill[]; defaultProvider: string; inboxNo
   <button id="saveNoteBtn" class="secondary">Save note to inbox</button>
 </div>
 <div id="inboxMsg" class="msg"></div>
+<label>Live model output <span class="dim">(raw provider stream, updates as the run executes)</span></label>
+<pre id="livePane" style="display:none;max-height:280px;overflow:auto"></pre>
 <pre id="outputPreview" style="display:none"></pre>
 </div>
 <h2>Saved inbox notes</h2>
@@ -316,15 +321,31 @@ document.getElementById('saveNoteBtn').onclick=async()=>{try{
 const t=document.getElementById('noteText').value;if(!t.trim())throw new Error('Nothing to save.');
 const r=await api('/api/inbox',{method:'POST',body:JSON.stringify({text:t})});
 msg('inboxMsg','Saved to '+r.name+' — reload page to see it listed.',true)}catch(e){msg('inboxMsg',e.message,false)}};
-document.getElementById('runBtn').onclick=async()=>{const b=document.getElementById('runBtn');b.disabled=true;try{
+document.getElementById('runBtn').onclick=async()=>{
+const b=document.getElementById('runBtn');b.disabled=true;
+const live=document.getElementById('livePane');live.textContent='';live.style.display='';
+document.getElementById('outputPreview').style.display='none';
+msg('inboxMsg','Running…',true);
+try{
 const body={noteText:document.getElementById('noteText').value,date:document.getElementById('logDate').value,
 skillId:document.getElementById('skillSel').value,providerId:document.getElementById('provSel').value,model:modelVal()};
 const r=await api('/api/run/daily',{method:'POST',body:JSON.stringify(body)});
-const link=document.createElement('a');link.href='/run?id='+r.runId;link.textContent='view run '+r.runId.slice(0,8);
-msg('inboxMsg','Daily log written to '+r.artifactPath+(r.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
-const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.artifactPath));
-const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display='';
-}catch(e){msg('inboxMsg',e.message,false)}finally{b.disabled=false}};
+const es=new EventSource('/api/runs/'+r.runId+'/stream');
+es.onmessage=(ev)=>{try{live.textContent+=JSON.parse(ev.data)+'\\n';live.scrollTop=live.scrollHeight}catch{}};
+es.addEventListener('done',async(ev)=>{
+es.close();
+let result={};try{result=JSON.parse(ev.data)}catch{}
+if(result.status==='completed'){
+const link=document.createElement('a');link.href='/run?id='+result.runId;link.textContent='view run '+result.runId.slice(0,8);
+msg('inboxMsg','Daily log written to '+result.artifactPath+(result.usedFallbackDir?' (local fallback folder)':'')+' — ',true,link);
+try{const pv=await api('/api/artifacts/content?path='+encodeURIComponent(result.artifactPath));
+const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pre.style.display=''}catch(e){}
+}else{
+msg('inboxMsg',result.error||'Run failed.',false);
+}
+b.disabled=false;
+});
+}catch(e){msg('inboxMsg',e.message,false);b.disabled=false}};
 </script>`);
 }
 
@@ -416,7 +437,7 @@ const pre=document.getElementById('outputPreview');pre.textContent=pv.content;pr
 export function pageRuns(d: { runs: RunRecord[] }): string {
   return layout('Runs', '/runs', `
 <h1>Runs</h1>
-<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Status</th><th>Created</th></tr>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th>Cost</th><th>Credits</th></tr>
 ${runRows(d.runs)}</table></div>`);
 }
 
@@ -436,6 +457,11 @@ ${kv('Skill file path', esc(r.skill_path))}
 ${kv('Skill content hash', esc(r.skill_hash))}
 ${kv('Provider', esc(r.provider_id))}
 ${kv('Provider command', r.provider_command ? esc(r.provider_command) : '<span class="dim">n/a (in-process)</span>')}
+${kv('Model used', r.model_used ? esc(r.model_used) : '<span class="dim">n/a</span>')}
+${kv('Tokens (input)', r.tokens_input ? String(r.tokens_input) : '<span class="dim">n/a</span>')}
+${kv('Tokens (output)', r.tokens_output ? String(r.tokens_output) : '<span class="dim">n/a</span>')}
+${kv('Estimated cost', r.cost_usd ? `$${r.cost_usd.toFixed(4)}` : '<span class="dim">n/a</span>')}
+${kv('Credits used', r.credits_used ? r.credits_used.toFixed(2) : '<span class="dim">n/a</span>')}
 ${kv('Input source', esc(r.input_source))}
 ${kv('Input files', r.input_files.length ? r.input_files.map(esc).join('<br>') : '<span class="dim">none</span>')}
 ${kv('Output artifact', r.output_artifact_path ? esc(r.output_artifact_path) : '<span class="dim">none</span>')}
@@ -444,7 +470,9 @@ ${kv('Completed', esc(r.completed_at || '—'))}
 ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` : '<span class="dim">none</span>')}
 </table></div>
 <h2>Input text</h2><div class="panel"><pre>${esc(r.input_text || '(empty)')}</pre></div>
-<h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>`);
+<h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>
+<h2>Prompt</h2>
+<div class="panel"><details><summary>Full prompt sent to model</summary><pre>${esc(r.prompt || '(not recorded)')}</pre></details></div>`);
 }
 
 export function pageArtifacts(d: { artifacts: ArtifactRecord[]; filter: string; previewPath: string; previewContent: string }): string {

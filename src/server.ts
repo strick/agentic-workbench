@@ -21,11 +21,12 @@ import {
   listDailyLogs,
   listInboxNotes,
   listWeeklyReports,
-  runDailyLog,
   runWeeklyReport,
   runWikiSource,
   saveInboxNote,
+  startDailyLog,
 } from './workflows.ts';
+import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
 
 type Ctx = {
@@ -251,10 +252,9 @@ const routes: Record<string, Handler> = {
 
   'POST /api/run/daily': async ({ cfg, body }) => {
     const args = DailyRunSchema.parse(body ?? {});
-    const result = await runDailyLog(cfg, args);
-    if ('error' in result && !('runId' in result)) return { status: 400, json: result };
-    if ('status' in result && result.status === 'error') return { status: 422, json: { error: result.error, runId: result.runId } };
-    return { json: result };
+    const result = startDailyLog(cfg, args);
+    if ('error' in result) return { status: 400, json: result };
+    return { status: 202, json: result };
   },
 
   'POST /api/run/weekly': async ({ cfg, body }) => {
@@ -325,9 +325,67 @@ function readBody(req: http.IncomingMessage): Promise<unknown> {
 
 const cfgBoot = loadConfig();
 
+const RUN_STREAM_RE = /^\/api\/runs\/([0-9a-fA-F-]{1,64})\/stream$/;
+
+// Server-Sent Events for a single run's live output. Handled outside the
+// routes table since it holds the connection open and writes incrementally
+// instead of returning one {status, html|json} value.
+function handleRunStreamSse(runId: string, req: http.IncomingMessage, res: http.ServerResponse): void {
+  const stream = getRunStream(runId);
+  if (!stream) {
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: 'Run not found or no longer streaming.' }));
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+
+  const writeLine = (line: string) => res.write(`data: ${JSON.stringify(line)}\n\n`);
+  const writeDone = (result: unknown) => res.write(`event: done\ndata: ${JSON.stringify(result)}\n\n`);
+
+  if (stream.done) {
+    for (const line of stream.bufferedLines()) writeLine(line);
+    writeDone(stream.result);
+    res.end();
+    return;
+  }
+
+  const onLine = (line: string) => writeLine(line);
+  const onDone = (result: unknown) => {
+    writeDone(result);
+    res.end();
+  };
+  // Subscribe first, then replay what's already buffered — since Node runs
+  // single-threaded, nothing can emit between the subscribe call and the
+  // synchronous replay loop below, so no lines are missed or duplicated.
+  stream.on('line', onLine);
+  stream.on('done', onDone);
+  for (const line of stream.bufferedLines()) writeLine(line);
+
+  const heartbeat = setInterval(() => res.write(':heartbeat\n\n'), 15_000);
+  const cleanup = () => {
+    clearInterval(heartbeat);
+    stream.off('line', onLine);
+    stream.off('done', onDone);
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+}
+
 const server = http.createServer(async (req, res) => {
   const cfg = loadConfig(); // re-read each request so Settings saves apply live
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+  const streamMatch = req.method === 'GET' ? url.pathname.match(RUN_STREAM_RE) : null;
+  if (streamMatch) {
+    handleRunStreamSse(streamMatch[1], req, res);
+    return;
+  }
+
   const key = `${req.method} ${url.pathname}`;
   const handler = routes[key];
   try {

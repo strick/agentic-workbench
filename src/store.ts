@@ -29,6 +29,12 @@ export type RunRecord = {
   completed_at: string;
   error: string;
   provider_command: string; // exact CLI command line minus the prompt body
+  model_used: string; // model name reported by (or estimated for) the provider
+  tokens_input: number;
+  tokens_output: number;
+  cost_usd: number; // real cost reported by the CLI, 0 if unknown/not applicable
+  credits_used: number; // GitHub Copilot premium-request credits ($0.10/credit), 0 if unknown/not applicable
+  prompt: string; // full composed prompt (skill markdown + input block) sent to the provider
 };
 
 export type ArtifactRecord = {
@@ -54,7 +60,9 @@ CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY, skill_id TEXT, skill_name TEXT, skill_path TEXT, skill_hash TEXT,
   provider_id TEXT, input_source TEXT, input_text TEXT, input_files TEXT,
   output_artifact_path TEXT, artifact_type TEXT, status TEXT,
-  created_at TEXT, completed_at TEXT, error TEXT, provider_command TEXT DEFAULT ''
+  created_at TEXT, completed_at TEXT, error TEXT, provider_command TEXT DEFAULT '',
+  model_used TEXT DEFAULT '', tokens_input INTEGER DEFAULT 0, tokens_output INTEGER DEFAULT 0,
+  cost_usd REAL DEFAULT 0, credits_used REAL DEFAULT 0, prompt TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY, run_id TEXT, type TEXT, path TEXT, title TEXT, created_at TEXT
@@ -105,6 +113,21 @@ export class Store {
         this.db.exec(`ALTER TABLE runs ADD COLUMN provider_command TEXT DEFAULT ''`);
       } catch {
         /* column already exists */
+      }
+      // migration for DBs created before model/token/cost tracking existed
+      for (const stmt of [
+        `ALTER TABLE runs ADD COLUMN model_used TEXT DEFAULT ''`,
+        `ALTER TABLE runs ADD COLUMN tokens_input INTEGER DEFAULT 0`,
+        `ALTER TABLE runs ADD COLUMN tokens_output INTEGER DEFAULT 0`,
+        `ALTER TABLE runs ADD COLUMN cost_usd REAL DEFAULT 0`,
+        `ALTER TABLE runs ADD COLUMN credits_used REAL DEFAULT 0`,
+        `ALTER TABLE runs ADD COLUMN prompt TEXT DEFAULT ''`,
+      ]) {
+        try {
+          this.db.exec(stmt);
+        } catch {
+          /* column already exists */
+        }
       }
       this.backend = 'sqlite';
     } else {
@@ -219,10 +242,26 @@ export class Store {
     return full;
   }
 
-  completeRun(id: string, patch: { output_artifact_path: string; provider_command?: string }): void {
+  completeRun(
+    id: string,
+    patch: {
+      output_artifact_path: string;
+      provider_command?: string;
+      model_used?: string;
+      tokens_input?: number;
+      tokens_output?: number;
+      cost_usd?: number;
+      credits_used?: number;
+    },
+  ): void {
     this.updateById('runs', id, {
       output_artifact_path: patch.output_artifact_path,
       provider_command: patch.provider_command ?? '',
+      model_used: patch.model_used ?? '',
+      tokens_input: patch.tokens_input ?? 0,
+      tokens_output: patch.tokens_output ?? 0,
+      cost_usd: patch.cost_usd ?? 0,
+      credits_used: patch.credits_used ?? 0,
       status: 'completed',
       completed_at: now(),
     });
@@ -244,7 +283,17 @@ export class Store {
     } catch {
       /* ignore */
     }
-    return { ...(r as unknown as RunRecord), input_files: files, provider_command: String(r.provider_command ?? '') };
+    return {
+      ...(r as unknown as RunRecord),
+      input_files: files,
+      provider_command: String(r.provider_command ?? ''),
+      model_used: String(r.model_used ?? ''),
+      tokens_input: Number(r.tokens_input ?? 0),
+      tokens_output: Number(r.tokens_output ?? 0),
+      cost_usd: Number(r.cost_usd ?? 0),
+      credits_used: Number(r.credits_used ?? 0),
+      prompt: String(r.prompt ?? ''),
+    };
   }
 
   getRun(id: string): RunRecord | null {

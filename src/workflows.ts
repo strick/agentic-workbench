@@ -4,8 +4,9 @@ import crypto from 'node:crypto';
 import { dataDir, type Config } from './config.ts';
 import { effectiveOutputDir, listMarkdownFiles, safeWriteFile } from './paths.ts';
 import { findSkill, type Skill } from './skills.ts';
-import { getProvider, type ArtifactType, type RunRequest } from './providers/index.ts';
+import { composePrompt, getProvider, type ArtifactType, type RunRequest } from './providers/index.ts';
 import { getStore, type RunRecord } from './store.ts';
+import { createRunStream } from './runStream.ts';
 
 export type WorkflowResult = {
   runId: string;
@@ -33,12 +34,27 @@ function executeWorkflow(args: {
   filename: string;
   sourceRef: string;
   model?: string;
-}): Promise<WorkflowResult> {
+}): { runId: string; promise: Promise<WorkflowResult> } {
   const { cfg, skill, providerId, artifactType } = args;
   const store = getStore(dataDir(cfg));
   const provider = getProvider(cfg, providerId);
+  const runId = crypto.randomUUID();
+
+  const stream = createRunStream(runId);
+  const req: RunRequest = {
+    skill,
+    artifactType,
+    inputText: args.inputText,
+    inputFiles: args.inputFiles.map((f) => ({ name: f.name, content: f.content })),
+    date: args.date,
+    sourceRef: args.sourceRef,
+    options: { model: args.model || undefined },
+    onChunk: (line) => stream.push(line),
+  };
+  const prompt = composePrompt(req);
+
   const run = store.createRun({
-    id: crypto.randomUUID(),
+    id: runId,
     skill_id: skill.id,
     skill_name: skill.name,
     skill_path: skill.path,
@@ -52,21 +68,17 @@ function executeWorkflow(args: {
     status: 'running',
     error: '',
     provider_command: '',
+    model_used: '',
+    tokens_input: 0,
+    tokens_output: 0,
+    cost_usd: 0,
+    credits_used: 0,
+    prompt,
   });
   store.upsertSkillSighting(skill);
   store.audit('run.started', { runId: run.id, skill: skill.name, provider: provider.id, artifactType });
 
-  const req: RunRequest = {
-    skill,
-    artifactType,
-    inputText: args.inputText,
-    inputFiles: args.inputFiles.map((f) => ({ name: f.name, content: f.content })),
-    date: args.date,
-    sourceRef: args.sourceRef,
-    options: { model: args.model || undefined },
-  };
-
-  return provider
+  const promise = provider
     .runSkill(req)
     .then((result) => {
       if (!result.ok) {
@@ -76,7 +88,15 @@ function executeWorkflow(args: {
       }
       const { dir, usedFallback } = effectiveOutputDir(cfg, OUTPUT_DIR_KEY[artifactType]);
       const artifactPath = safeWriteFile(cfg, dir, args.filename, result.output);
-      store.completeRun(run.id, { output_artifact_path: artifactPath, provider_command: result.commandLine });
+      store.completeRun(run.id, {
+        output_artifact_path: artifactPath,
+        provider_command: result.commandLine,
+        model_used: result.usage?.model,
+        tokens_input: result.usage?.tokensInput,
+        tokens_output: result.usage?.tokensOutput,
+        cost_usd: result.usage?.costUsd,
+        credits_used: result.usage?.credits,
+      });
       store.addArtifact({
         run_id: run.id,
         type: artifactType,
@@ -92,13 +112,24 @@ function executeWorkflow(args: {
       store.audit('run.failed', { runId: run.id, error: msg });
       return { runId: run.id, status: 'error' as const, error: msg };
     });
+
+  promise.then((result) => stream.finish(result));
+
+  return { runId: run.id, promise };
 }
 
 // --- Workflow 1: Daily Work Log --------------------------------------------
-export async function runDailyLog(
-  cfg: Config,
-  args: { noteText?: string; inboxFile?: string; skillId: string; providerId: string; date?: string; model?: string },
-): Promise<WorkflowResult | { error: string }> {
+type DailyLogArgs = { noteText?: string; inboxFile?: string; skillId: string; date?: string };
+type ResolvedDailyLogInput = {
+  skill: Skill;
+  inputText: string;
+  inputSource: string;
+  sourceRef: string;
+  inputFiles: Array<{ name: string; path: string; content: string }>;
+  date: string;
+};
+
+function resolveDailyLogInput(cfg: Config, args: DailyLogArgs): ResolvedDailyLogInput | { error: string } {
   const skill = findSkill(cfg, args.skillId);
   if (!skill) return { error: `Skill not found: ${args.skillId}` };
   let inputText = (args.noteText ?? '').trim();
@@ -119,6 +150,16 @@ export async function runDailyLog(
   }
   if (!inputText) return { error: 'No input notes provided.' };
   const date = args.date || new Date().toISOString().slice(0, 10);
+  return { skill, inputText, inputSource, sourceRef, inputFiles, date };
+}
+
+export async function runDailyLog(
+  cfg: Config,
+  args: { noteText?: string; inboxFile?: string; skillId: string; providerId: string; date?: string; model?: string },
+): Promise<WorkflowResult | { error: string }> {
+  const resolved = resolveDailyLogInput(cfg, args);
+  if ('error' in resolved) return resolved;
+  const { skill, inputText, inputSource, sourceRef, inputFiles, date } = resolved;
   return executeWorkflow({
     cfg,
     skill,
@@ -131,7 +172,31 @@ export async function runDailyLog(
     filename: `${date}-daily-log.md`,
     sourceRef,
     model: args.model,
+  }).promise;
+}
+
+/** Starts a daily-log run without waiting for it to finish; the caller watches the run's live stream / polls the run record for completion. */
+export function startDailyLog(
+  cfg: Config,
+  args: { noteText?: string; inboxFile?: string; skillId: string; providerId: string; date?: string; model?: string },
+): { runId: string } | { error: string } {
+  const resolved = resolveDailyLogInput(cfg, args);
+  if ('error' in resolved) return resolved;
+  const { skill, inputText, inputSource, sourceRef, inputFiles, date } = resolved;
+  const { runId } = executeWorkflow({
+    cfg,
+    skill,
+    providerId: args.providerId,
+    artifactType: 'daily-log',
+    inputSource,
+    inputText,
+    inputFiles,
+    date,
+    filename: `${date}-daily-log.md`,
+    sourceRef,
+    model: args.model,
   });
+  return { runId };
 }
 
 // --- Daily-log discovery / week grouping ------------------------------------
@@ -221,7 +286,7 @@ export async function runWeeklyReport(
     filename: `${week}-weekly-report.md`,
     sourceRef: `${files.length} daily logs`,
     model: args.model,
-  });
+  }).promise;
 }
 
 // --- Workflow 3: Wiki Source Builder ----------------------------------------
@@ -247,7 +312,7 @@ export async function runWikiSource(
     filename: `${date}-wiki-source.md`,
     sourceRef: `${files.length} source notes`,
     model: args.model,
-  });
+  }).promise;
 }
 
 // --- Inbox -------------------------------------------------------------------

@@ -1,12 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { resolveConfigPath, type Config, type ProviderId } from '../config.ts';
 import type { Skill } from '../skills.ts';
 import type { Store } from '../store.ts';
 import { genDailyLog, genWeeklyReport, genWikiSource } from '../generate.ts';
 
 export type ArtifactType = 'daily-log' | 'weekly-report' | 'wiki-source';
+
+/** GitHub Copilot "premium request" credit price: $100 buys 10,000 credits. */
+const USD_PER_CREDIT = 0.01;
 
 export type ProviderOptions = { model?: string };
 
@@ -18,10 +21,22 @@ export type RunRequest = {
   date: string; // ISO date for daily/wiki, week label for weekly
   sourceRef: string;
   options?: ProviderOptions;
+  /** Called with each line of raw provider output as it streams in (CLI providers only). */
+  onChunk?: (line: string) => void;
+};
+
+/** Model name + token/cost/credit usage reported by (or estimated for) a provider run. */
+export type UsageInfo = {
+  model?: string;
+  tokensInput?: number;
+  tokensOutput?: number;
+  costUsd?: number;
+  /** GitHub Copilot "premium request" credits ($100 = 10,000 credits, i.e. $0.01/credit). */
+  credits?: number;
 };
 
 export type RunResult =
-  | { ok: true; output: string; commandLine?: string }
+  | { ok: true; output: string; commandLine?: string; usage?: UsageInfo }
   | { ok: false; error: string; commandLine?: string };
 
 export type ProviderHealth = {
@@ -50,6 +65,10 @@ function summarize(runId: string, store: Store): string {
   );
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ---------------------------------------------------------------------------
 export class MockProvider implements AgentProvider {
   id = 'mock' as const;
@@ -62,6 +81,12 @@ export class MockProvider implements AgentProvider {
 
   async runSkill(req: RunRequest): Promise<RunResult> {
     try {
+      req.onChunk?.(`[mock] loading skill "${req.skill.name}"...`);
+      await delay(150);
+      req.onChunk?.(`[mock] reading ${req.inputFiles.length || 1} input source(s)...`);
+      await delay(150);
+      req.onChunk?.(`[mock] drafting ${req.artifactType} markdown...`);
+      await delay(200);
       let output: string;
       if (req.artifactType === 'daily-log') {
         output = genDailyLog({
@@ -86,7 +111,16 @@ export class MockProvider implements AgentProvider {
           providerId: this.id,
         });
       }
-      return { ok: true, output };
+      req.onChunk?.('[mock] done.');
+      return {
+        ok: true,
+        output,
+        usage: {
+          model: 'mock',
+          tokensInput: Math.ceil(req.inputText.length / 4),
+          tokensOutput: Math.ceil(output.length / 4),
+        },
+      };
     } catch (err) {
       return { ok: false, error: `MockProvider failed: ${(err as Error).message}` };
     }
@@ -98,17 +132,24 @@ export class MockProvider implements AgentProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Real CLI execution. Providers are invoked with execFile only — never a
-// shell — with a hard timeout and output cap. The prompt is the skill
-// markdown + a delimited input block + a "markdown only" instruction.
+// Real CLI execution. Providers are invoked with spawn only — never a
+// shell — with a hard timeout and output cap, streaming stdout/stderr lines
+// to the caller as they arrive (see execInvocation's onChunk). The prompt is
+// the skill markdown + a delimited input block + a "markdown only" instruction.
+//
+// Copilot/Claude CLIs emit their live progress as JSONL event streams, not
+// plain text — passed through raw that's a wall of JSON in the live-run
+// pane. Each provider overrides makeLiveLineHandler() to turn those events
+// into short terminal-style status lines and the actual streamed answer
+// text, so a run reads like a real CLI working rather than a JSON dump.
 
 const CLI_TIMEOUT_MS = 120_000;
-const CLI_MAX_BUFFER = 8 * 1024 * 1024; // execFile hard cap (stdout+stderr each)
+const CLI_MAX_BUFFER = 8 * 1024 * 1024; // manual accumulation cap (stdout+stderr each)
 const MAX_ARTIFACT_BYTES = 1_000_000; // final artifact size cap
 const MAX_INLINE_PROMPT = 30_000; // stay under the Windows 32 KiB command-line limit
 const MODEL_RE = /^[A-Za-z0-9._:-]{1,64}$/; // keeps argv safe even via cmd.exe shims
 
-function composePrompt(req: RunRequest): string {
+export function composePrompt(req: RunRequest): string {
   return [
     req.skill.raw.trim(),
     '',
@@ -121,6 +162,72 @@ function composePrompt(req: RunRequest): string {
   ].join('\n');
 }
 
+// GitHub Copilot billing moved from a flat "1 premium request per prompt"
+// legacy counter to per-token "AI credits" (1 credit = $0.01 USD), priced
+// per model (see docs.github.com/copilot/reference/copilot-billing/models-and-pricing).
+// Copilot CLI's headless `--output-format=json` only ever reports the old
+// `usage.premiumRequests` request-COUNT field (GitHub's own SDK marks this
+// `@internal`/legacy) — it does not report actual token-based cost. Treating
+// that count as if it were the AI-credit cost silently mis-reports real
+// spend (e.g. always shows "1 credit" for any single-turn run, regardless of
+// how many tokens it actually used). Instead we estimate real cost from the
+// model + token counts using GitHub's published per-1M-token rates below.
+// Unrecognized/future model ids fall back to undefined (no fabricated
+// number) rather than a wrong price.
+const USD_PER_1M_TOKENS: Record<string, { input: number; output: number }> = {
+  'gpt-5-mini': { input: 0.25, output: 2.0 },
+  'gpt-5.3-codex': { input: 1.75, output: 14.0 },
+  'gpt-5.4': { input: 2.5, output: 15.0 },
+  'gpt-5.4-mini': { input: 0.75, output: 4.5 },
+  'gpt-5.4-nano': { input: 0.2, output: 1.25 },
+  'gpt-5.5': { input: 5.0, output: 30.0 },
+  'claude-haiku-4.5': { input: 1.0, output: 5.0 },
+  'claude-sonnet-4': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4.5': { input: 3.0, output: 15.0 },
+  'claude-sonnet-4.6': { input: 3.0, output: 15.0 },
+  'claude-sonnet-5': { input: 2.0, output: 10.0 }, // promotional pricing through 2026-08-31
+  'claude-opus-4.5': { input: 5.0, output: 25.0 },
+  'claude-opus-4.6': { input: 5.0, output: 25.0 },
+  'claude-opus-4.7': { input: 5.0, output: 25.0 },
+  'claude-opus-4.8': { input: 5.0, output: 25.0 },
+  'claude-fable-5': { input: 10.0, output: 50.0 },
+  'gemini-2.5-pro': { input: 1.25, output: 10.0 },
+  'gemini-3-flash': { input: 0.5, output: 3.0 },
+  'gemini-3.1-pro': { input: 2.0, output: 12.0 },
+  'gemini-3.5-flash': { input: 1.5, output: 9.0 },
+  'raptor-mini': { input: 0.25, output: 2.0 },
+  'mai-code-1-flash': { input: 0.75, output: 4.5 },
+  'kimi-k2.7-code': { input: 0.95, output: 4.0 },
+};
+
+/** Normalizes a model id/display name (e.g. "Claude Opus 4.8 (fast mode) (preview)",
+ * "claude-sonnet-5") into the lowercase-hyphenated form used as USD_PER_1M_TOKENS keys. */
+function normalizeModelId(model: string): string {
+  return model
+    .toLowerCase()
+    .replace(/\((?:fast mode|preview)\)/g, '')
+    .trim()
+    .replace(/\s+/g, '-');
+}
+
+/** Estimates real USD cost from a model id + token counts using GitHub's
+ * published per-token pricing. Returns undefined for unrecognized models
+ * rather than guessing — callers should fall back to other signals if any. */
+function estimateCostUsd(model: string | undefined, tokensInput: number | undefined, tokensOutput: number | undefined): number | undefined {
+  if (!model) return undefined;
+  const rates = USD_PER_1M_TOKENS[normalizeModelId(model)];
+  if (!rates) return undefined;
+  const inCost = ((tokensInput ?? 0) / 1_000_000) * rates.input;
+  const outCost = ((tokensOutput ?? 0) / 1_000_000) * rates.output;
+  return inCost + outCost;
+}
+
+/** Rough token estimate (chars/4) for text we don't get an exact count for
+ * from a provider — same heuristic MockProvider uses for its estimates. */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, '');
 }
@@ -129,6 +236,49 @@ function stripAnsi(s: string): string {
 function unfence(s: string): string {
   const m = s.trim().match(/^```(?:markdown|md)?\r?\n([\s\S]*?)\r?\n```$/);
   return m ? m[1] : s.trim();
+}
+
+function toNonEmptyString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+}
+
+/** Like toNonEmptyString but preserves whitespace — required for streamed
+ * delta text, where leading/trailing spaces between chunks are significant
+ * (trimming them would glue words together, e.g. "foo " + "bar" -> "foobar"). */
+function toRawString(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+function toFiniteNumber(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Buffers streamed delta text and emits complete lines as they're formed,
+ * holding the trailing partial line until more text (or `flush`) arrives.
+ * Used to turn token-by-token JSONL deltas into readable streamed lines
+ * instead of emitting a ragged fragment per event.
+ */
+class TextAccumulator {
+  private partial = '';
+  private emit: (line: string) => void;
+  constructor(emit: (line: string) => void) {
+    this.emit = emit;
+  }
+  add(text: string): void {
+    if (!text) return;
+    const combined = this.partial + text;
+    const parts = combined.split(/\r?\n/);
+    this.partial = parts.pop() ?? '';
+    for (const p of parts) this.emit(p);
+  }
+  flush(): void {
+    if (this.partial) {
+      this.emit(this.partial);
+      this.partial = '';
+    }
+  }
 }
 
 type Invocation = {
@@ -141,24 +291,68 @@ type Invocation = {
 
 function execInvocation(
   inv: Invocation,
+  onChunk?: (line: string, isStdout: boolean) => void,
 ): Promise<{ failed: boolean; codeInfo: string; timedOut: boolean; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = execFile(
-      inv.file,
-      inv.args,
-      { timeout: CLI_TIMEOUT_MS, maxBuffer: CLI_MAX_BUFFER, windowsHide: true, encoding: 'utf8' },
-      (err, stdout, stderr) => {
-        const e = err as (NodeJS.ErrnoException & { killed?: boolean }) | null;
-        resolve({
-          failed: Boolean(e),
-          // exit code for normal failures, errno string (e.g. ENOENT) for spawn failures
-          codeInfo: e ? String(e.code ?? e.message.split('\n')[0]) : '0',
-          timedOut: Boolean(e?.killed),
-          stdout: stdout ?? '',
-          stderr: stderr ?? '',
-        });
-      },
-    );
+    const child = spawn(inv.file, inv.args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    let stdoutPartial = '';
+    let stderrPartial = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+    let overflowed = false;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, CLI_TIMEOUT_MS);
+
+    const finish = (failed: boolean, codeInfo: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ failed, codeInfo, timedOut, stdout, stderr });
+    };
+
+    // Splits each chunk into complete lines (buffering a trailing partial
+    // line across chunks) and forwards them to onChunk as they arrive, so
+    // the live-run pane sees output progressively instead of all at once.
+    const drain = (chunk: Buffer, isStdout: boolean) => {
+      const text = chunk.toString('utf8');
+      if (isStdout) {
+        stdout += text;
+        stdoutBytes += chunk.length;
+      } else {
+        stderr += text;
+        stderrBytes += chunk.length;
+      }
+      if (stdoutBytes > CLI_MAX_BUFFER || stderrBytes > CLI_MAX_BUFFER) {
+        if (!overflowed) {
+          overflowed = true;
+          child.kill();
+        }
+        return;
+      }
+      const combined = (isStdout ? stdoutPartial : stderrPartial) + text;
+      const parts = combined.split(/\r?\n/);
+      const trailing = parts.pop() ?? '';
+      if (isStdout) stdoutPartial = trailing;
+      else stderrPartial = trailing;
+      for (const line of parts) if (line) onChunk?.(line, isStdout);
+    };
+
+    child.stdout?.on('data', (c: Buffer) => drain(c, true));
+    child.stderr?.on('data', (c: Buffer) => drain(c, false));
+    child.on('error', (err: NodeJS.ErrnoException) => {
+      finish(true, String(err.code ?? err.message.split('\n')[0]));
+    });
+    child.on('close', (code) => {
+      finish(code !== 0, overflowed ? 'OUTPUT_TOO_LARGE' : String(code ?? 0));
+    });
+
     if (child.stdin) {
       child.stdin.on('error', () => {});
       if (inv.stdinData !== undefined) child.stdin.write(inv.stdinData);
@@ -189,6 +383,26 @@ abstract class CliProviderBase implements AgentProvider {
    * accept a stdin prompt.
    */
   protected abstract buildArgs(inlinePrompt: string | null, model: string): string[] | null;
+
+  /**
+   * Extract the final artifact markdown (and any model/token/cost usage) from
+   * raw CLI stdout. Default: stdout is the artifact text as-is, no usage.
+   * Providers with structured (JSON/JSONL) output formats override this.
+   */
+  protected parseOutput(stdout: string, _req: RunRequest, _model: string): { output: string; usage?: UsageInfo } {
+    return { output: stdout };
+  }
+
+  /**
+   * Turns raw stdout/stderr lines from the running CLI into lines for the
+   * live-run pane. Default: pass stdout through unchanged and prefix stderr,
+   * i.e. today's plain-text behavior. Providers with structured (JSONL)
+   * live-output formats override this to render friendly status/typing
+   * lines instead of raw JSON — see ClaudeCliProvider/CopilotCliProvider.
+   */
+  protected makeLiveLineHandler(onChunk: (line: string) => void, _req: RunRequest): (rawLine: string, isStdout: boolean) => void {
+    return (rawLine, isStdout) => onChunk(isStdout ? rawLine : `[stderr] ${rawLine}`);
+  }
 
   async healthCheck(): Promise<ProviderHealth> {
     const cmd = this.resolveCommand();
@@ -247,7 +461,7 @@ abstract class CliProviderBase implements AgentProvider {
     const inv = this.buildInvocation(health.command ?? this.resolveCommand(), prompt, req.options?.model ?? '');
     if ('error' in inv) return { ok: false, error: inv.error };
 
-    const res = await execInvocation(inv);
+    const res = await execInvocation(inv, req.onChunk ? this.makeLiveLineHandler(req.onChunk, req) : undefined);
     const stderrTail = stripAnsi(res.stderr).trim().slice(-800);
     if (res.timedOut) {
       return { ok: false, error: `${this.name} timed out after ${CLI_TIMEOUT_MS / 1000}s.`, commandLine: inv.display };
@@ -259,7 +473,8 @@ abstract class CliProviderBase implements AgentProvider {
         commandLine: inv.display,
       };
     }
-    let output = unfence(stripAnsi(res.stdout));
+    const parsed = this.parseOutput(res.stdout, req, req.options?.model ?? '');
+    let output = unfence(stripAnsi(parsed.output));
     if (!output) {
       return {
         ok: false,
@@ -270,7 +485,7 @@ abstract class CliProviderBase implements AgentProvider {
     if (Buffer.byteLength(output, 'utf8') > MAX_ARTIFACT_BYTES) {
       output = output.slice(0, MAX_ARTIFACT_BYTES) + '\n\n> [output truncated at 1 MB by Agentic Workbench]\n';
     }
-    return { ok: true, output: output + '\n', commandLine: inv.display };
+    return { ok: true, output: output + '\n', commandLine: inv.display, usage: parsed.usage };
   }
 
   async summarizeRun(runId: string, store: Store): Promise<string> {
@@ -299,10 +514,107 @@ export class ClaudeCliProvider extends CliProviderBase {
   name = 'Claude CLI';
   defaultCommand = 'claude';
 
-  // claude -p "<prompt>" --output-format text; with no positional prompt,
-  // -p reads the prompt from stdin.
+  // claude -p "<prompt>" --output-format stream-json --verbose
+  // --include-partial-messages; with no positional prompt, -p reads the
+  // prompt from stdin. stream-json emits NDJSON events as the run
+  // progresses (so the live-run pane can show real-time output), ending
+  // with a `result`-typed event carrying the artifact text plus real
+  // usage/cost metadata (see parseOutput below). --verbose and
+  // --include-partial-messages are required by the CLI for this mode.
   protected buildArgs(inlinePrompt: string | null, model: string): string[] {
-    return ['-p', ...(inlinePrompt !== null ? [inlinePrompt] : []), '--output-format', 'text', ...(model ? ['--model', model] : [])];
+    return [
+      '-p',
+      ...(inlinePrompt !== null ? [inlinePrompt] : []),
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      ...(model ? ['--model', model] : []),
+    ];
+  }
+
+  // claude -p --output-format stream-json emits NDJSON — one event object
+  // per line — ending with a `type: 'result'` event that carries the final
+  // artifact text in `result` plus usage/cost metadata, in the same shape
+  // the older buffered `json` mode returned as its single object. Scan for
+  // the last such event; older CLI versions (or unexpected output) may not
+  // emit any JSON at all — fall back to treating stdout as the raw artifact
+  // text so generation never breaks.
+  protected parseOutput(stdout: string, _req: RunRequest, model: string): { output: string; usage?: UsageInfo } {
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    let resultObj: Record<string, unknown> | undefined;
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (obj && obj.type === 'result') resultObj = obj;
+      } catch {
+        /* not a JSON line — ignore (banner text, log noise, etc.) */
+      }
+    }
+    if (!resultObj) return { output: stdout };
+    const usageObj = (resultObj.usage ?? {}) as Record<string, unknown>;
+    return {
+      output: toNonEmptyString(resultObj.result) ?? '',
+      usage: {
+        model: toNonEmptyString(resultObj.model) ?? (model || undefined),
+        tokensInput: toFiniteNumber(usageObj.input_tokens),
+        tokensOutput: toFiniteNumber(usageObj.output_tokens),
+        costUsd: toFiniteNumber(resultObj.total_cost_usd) ?? toFiniteNumber(resultObj.cost_usd),
+      },
+    };
+  }
+
+  // Renders `--output-format stream-json --include-partial-messages` NDJSON
+  // as terminal-style lines instead of raw JSON: a short status line for
+  // session init, the answer text streamed in as `stream_event` content
+  // deltas arrive (so it reads like the model typing), and a one-line
+  // summary from the final `result` event. Any event type not recognized
+  // here (turn bookkeeping, tool-use deltas, etc.) is silently dropped
+  // rather than dumped as JSON; non-JSON lines (banner/log text) pass
+  // through unchanged.
+  protected makeLiveLineHandler(onChunk: (line: string) => void, _req: RunRequest): (rawLine: string, isStdout: boolean) => void {
+    const acc = new TextAccumulator(onChunk);
+    return (rawLine, isStdout) => {
+      if (!isStdout) return onChunk(`[stderr] ${rawLine}`);
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(rawLine) as Record<string, unknown>;
+      } catch {
+        return onChunk(rawLine); // not JSON — pass through as-is
+      }
+      const type = toNonEmptyString(obj.type);
+      switch (type) {
+        case 'system': {
+          if (toNonEmptyString(obj.subtype) === 'init') {
+            const model = toNonEmptyString(obj.model);
+            onChunk(model ? `» session started (model: ${model})` : '» session started');
+          }
+          return;
+        }
+        case 'stream_event': {
+          const ev = (obj.event ?? {}) as Record<string, unknown>;
+          const evType = toNonEmptyString(ev.type);
+          if (evType === 'content_block_delta') {
+            const delta = (ev.delta ?? {}) as Record<string, unknown>;
+            acc.add(toRawString(delta.text));
+          } else if (evType === 'message_stop') {
+            acc.flush();
+          }
+          return;
+        }
+        case 'result': {
+          acc.flush();
+          const cost = toFiniteNumber(obj.total_cost_usd) ?? toFiniteNumber(obj.cost_usd);
+          onChunk(cost !== undefined ? `» done ($${cost.toFixed(4)})` : '» done.');
+          return;
+        }
+        default:
+          return; // suppress turn/tool bookkeeping noise
+      }
+    };
   }
 }
 
@@ -314,9 +626,180 @@ export class CopilotCliProvider extends CliProviderBase {
   // copilot -p/--prompt <text> is its non-interactive mode; it has no stdin
   // prompt equivalent, so oversized/shim cases return null (clear error).
   // No --allow-* flags are passed: Copilot cannot edit files or run commands.
+  // --output-format=json emits JSONL (one JSON object per line) carrying the
+  // final response plus usage/cost metadata (see parseOutput below).
   protected buildArgs(inlinePrompt: string | null, model: string): string[] | null {
     if (inlinePrompt === null) return null;
-    return ['-p', inlinePrompt, ...(model ? ['--model', model] : [])];
+    return ['-p', inlinePrompt, '--output-format=json', ...(model ? ['--model', model] : [])];
+  }
+
+  // Copilot CLI's `--output-format=json` emits JSONL — one event object per
+  // line, shaped like `{ type, data, ... }` (confirmed from a real run):
+  //   - `assistant.message`      : data.content (final text), data.model, data.outputTokens
+  //   - `session.tools_updated`  : data.model (fallback if assistant.message is missing)
+  //   - `result`                 : top-level `usage.premiumRequests` — the legacy GitHub
+  //                                 Copilot "premium request" COUNT (1 per prompt sent), not
+  //                                 a token-based cost figure. Copilot CLI never reports real
+  //                                 $ cost or input tokens, so we estimate both: input tokens
+  //                                 from the composed prompt length, and $ cost from the
+  //                                 model + token counts via USD_PER_1M_TOKENS. premiumRequests
+  //                                 is kept only as a last-resort fallback if the model is
+  //                                 unrecognized (no pricing data available).
+  // Older/unknown CLI versions may not emit any of these — this function
+  // scans defensively and falls back to raw stdout text if nothing matches.
+  protected parseOutput(stdout: string, req: RunRequest, model: string): { output: string; usage?: UsageInfo } {
+    const lines = stdout
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const objects: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj && typeof obj === 'object') objects.push(obj as Record<string, unknown>);
+      } catch {
+        /* not a JSON line — ignore (banner text, log noise, etc.) */
+      }
+    }
+    if (!objects.length) return { output: stdout };
+
+    let resultText = '';
+    let usedModel: string | undefined;
+    let tokensInput: number | undefined;
+    let tokensOutput: number | undefined;
+    let costUsd: number | undefined;
+    let credits: number | undefined;
+    let legacyPremiumRequests: number | undefined;
+
+    for (const obj of objects) {
+      const type = toNonEmptyString(obj.type);
+      const data = (obj.data ?? {}) as Record<string, unknown>;
+
+      if (type === 'assistant.message') {
+        resultText = toNonEmptyString(data.content) ?? resultText;
+        usedModel = toNonEmptyString(data.model) ?? usedModel;
+        tokensOutput = toFiniteNumber(data.outputTokens) ?? tokensOutput;
+        tokensInput = toFiniteNumber(data.inputTokens) ?? tokensInput;
+      } else if (type === 'session.tools_updated') {
+        usedModel = toNonEmptyString(data.model) ?? usedModel;
+      } else if (type === 'result') {
+        // `usage` lives on the top-level result event, not under `data`.
+        const usageObj = (obj.usage ?? data.usage ?? {}) as Record<string, unknown>;
+        // Legacy request-count field — NOT a credit/cost figure. Kept only as
+        // `legacyPremiumRequests` for the last-resort fallback below.
+        legacyPremiumRequests = toFiniteNumber(usageObj.premiumRequests) ?? legacyPremiumRequests;
+        costUsd = toFiniteNumber(usageObj.cost) ?? toFiniteNumber(usageObj.total_cost_usd) ?? costUsd;
+      }
+
+      // Fallback field names in case future/older CLI builds use different
+      // shapes (e.g. flat objects instead of the `{ type, data }` envelope,
+      // or OTel-style attribute names).
+      if (!resultText) {
+        resultText = toNonEmptyString(obj.result) ?? toNonEmptyString(obj.content) ?? toNonEmptyString(obj.text) ?? resultText;
+      }
+      usedModel = usedModel ?? toNonEmptyString(obj.model) ?? toNonEmptyString(obj['gen_ai.response.model']);
+      const flatUsage = (obj.usage ?? {}) as Record<string, unknown>;
+      tokensInput = tokensInput ?? toFiniteNumber(flatUsage.input_tokens) ?? toFiniteNumber(obj['gen_ai.usage.input_tokens']);
+      tokensOutput = tokensOutput ?? toFiniteNumber(flatUsage.output_tokens) ?? toFiniteNumber(obj['gen_ai.usage.output_tokens']);
+      costUsd = costUsd ?? toFiniteNumber(obj.cost) ?? toFiniteNumber(obj['github.copilot.cost']);
+      credits =
+        credits ??
+        toFiniteNumber(obj.credits) ??
+        toFiniteNumber(obj['github.copilot.credits']) ??
+        toFiniteNumber(obj['github.copilot.aiu']);
+    }
+
+    const finalModel = usedModel ?? (model || undefined);
+    // Copilot CLI doesn't report input tokens — estimate from the composed
+    // prompt (same chars/4 heuristic MockProvider uses) so cost isn't just
+    // output-only.
+    if (tokensInput === undefined) tokensInput = estimateTokens(composePrompt(req));
+
+    // Prefer a real cost estimate derived from model + token counts. Only if
+    // the model is unrecognized (no pricing data) do we fall back to the
+    // legacy premiumRequests request-count as a rough, clearly-approximate
+    // stand-in for credits.
+    if (costUsd === undefined) costUsd = estimateCostUsd(finalModel, tokensInput, tokensOutput);
+    if (credits === undefined && costUsd !== undefined) credits = costUsd / USD_PER_CREDIT;
+    if (credits === undefined && legacyPremiumRequests !== undefined) credits = legacyPremiumRequests;
+    if (costUsd === undefined && credits !== undefined) costUsd = credits * USD_PER_CREDIT;
+
+    return {
+      output: resultText || stdout,
+      usage: { model: finalModel, tokensInput, tokensOutput, costUsd, credits },
+    };
+  }
+
+  // Renders `--output-format=json` NDJSON as terminal-style lines instead of
+  // raw JSON (event shapes confirmed from a real run — see parseOutput
+  // above): a short status line as MCP servers/skills load and the model is
+  // selected, the answer text streamed in as `assistant.message_delta`
+  // events arrive (so it reads like the model typing), and a one-line
+  // summary from the final `result` event's credit usage. Turn/session
+  // bookkeeping events (turn_start/end, idle, message envelopes, etc.) are
+  // silently dropped rather than dumped as JSON; non-JSON lines (banner/log
+  // text) pass through unchanged.
+  protected makeLiveLineHandler(onChunk: (line: string) => void, req: RunRequest): (rawLine: string, isStdout: boolean) => void {
+    const acc = new TextAccumulator(onChunk);
+    let liveModel: string | undefined;
+    let liveTokensOutput: number | undefined;
+    return (rawLine, isStdout) => {
+      if (!isStdout) return onChunk(`[stderr] ${rawLine}`);
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(rawLine) as Record<string, unknown>;
+      } catch {
+        return onChunk(rawLine); // not JSON — pass through as-is
+      }
+      const type = toNonEmptyString(obj.type);
+      const data = (obj.data ?? {}) as Record<string, unknown>;
+      switch (type) {
+        case 'session.mcp_servers_loaded': {
+          const servers = Array.isArray(data.servers) ? (data.servers as Record<string, unknown>[]) : [];
+          const names = servers.map((s) => toNonEmptyString(s.name)).filter((n): n is string => !!n);
+          if (names.length) onChunk(`» mcp: ${names.join(', ')} ready`);
+          return;
+        }
+        case 'session.skills_loaded': {
+          const skills = Array.isArray(data.skills) ? (data.skills as unknown[]) : [];
+          onChunk(`» loaded ${skills.length} skill(s)`);
+          return;
+        }
+        case 'session.tools_updated': {
+          const m = toNonEmptyString(data.model);
+          if (m) {
+            liveModel = m;
+            onChunk(`» model: ${m}`);
+          }
+          return;
+        }
+        case 'assistant.turn_start':
+          onChunk('» generating...');
+          return;
+        case 'assistant.message_delta':
+          acc.add(toRawString(data.deltaContent));
+          return;
+        case 'assistant.message':
+          liveModel = toNonEmptyString(data.model) ?? liveModel;
+          liveTokensOutput = toFiniteNumber(data.outputTokens) ?? liveTokensOutput;
+          return;
+        case 'assistant.turn_end':
+          acc.flush();
+          return;
+        case 'result': {
+          const usageObj = (obj.usage ?? data.usage ?? {}) as Record<string, unknown>;
+          const costUsd =
+            toFiniteNumber(usageObj.cost) ??
+            toFiniteNumber(usageObj.total_cost_usd) ??
+            estimateCostUsd(liveModel ?? req.options?.model, estimateTokens(composePrompt(req)), liveTokensOutput);
+          const credits = costUsd !== undefined ? costUsd / USD_PER_CREDIT : toFiniteNumber(usageObj.premiumRequests);
+          onChunk(credits !== undefined ? `» done (~${credits.toFixed(2)} credit${credits === 1 ? '' : 's'} used)` : '» done.');
+          return;
+        }
+        default:
+          return; // suppress mcp-connect noise, message envelopes, idle, etc.
+      }
+    };
   }
 }
 
