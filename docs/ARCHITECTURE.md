@@ -51,7 +51,10 @@ Bad values are dropped individually — a corrupt config never prevents startup.
 | WorkflowDef | code (`workflowDefs.ts` registry) | Skill kind + input source + output type + destination + approval rule; the original three flows are built-in templates |
 | Skill / SkillVersion | filesystem is source of truth; sightings + hash history in DB | id = hash(source+path); version = distinct content hash |
 | AgentProvider | code + health snapshots in DB | `mock`, `claude-cli`, `copilot-cli` |
-| Run | DB | full provenance: skill path + hash, provider, input, output, status, timestamps, error |
+| Run | DB | full provenance: skill path + hash, provider, input, output, status, timestamps, error; `comparison_id` groups runs launched together |
+| SkillPref | DB | preferred provider + model per skill (used as Lab defaults) |
+| GoldenExample | DB | saved input/output pairs per skill version — regression baseline material |
+| RunScore | DB | human good/okay/bad rating of a run's output (id = run id, re-scoring replaces) |
 | Artifact | DB + markdown file | type: daily-log / weekly-report / wiki-source |
 | ConfigPath | DB snapshot of last validation | status: writable / read-only / missing / unreadable / not-configured |
 | Approval | DB table (placeholder) | reserved for future external writes (wiki/Git/email) — nothing in MVP needs approval because nothing external is written |
@@ -104,6 +107,16 @@ is one registry entry plus (optionally) an example skill.
     (`provider_command`, e.g. `copilot.exe -p <prompt> --model claude-sonnet-4`); stderr
     (ANSI-stripped, last 800 chars) is captured into the run's error field on failure.
   - PATH lookup prefers `.exe` over npm's extensionless/`.cmd` shims.
+
+## Skill Lab
+
+`/lab` is the prompt/skill governance surface: every skill with its content-hash
+version history, a preferred provider/model per skill, sandboxed test runs
+against pasted sample input, multi-provider side-by-side comparison (runs share
+a `comparison_id`), good/okay/bad output scoring, and golden examples (input +
+output captured against the skill hash that produced them). Lab runs reuse the
+normal workflow engine and provenance but always write to `data/lab-outputs`,
+and lab outputs never appear as workflow source files.
 
 ## Safety model
 

@@ -124,6 +124,20 @@ Every run records: run id, skill id/path/content-hash, provider, input source, i
 text/files, output artifact path, artifact type, status, timestamps, and errors. See the
 **Runs** and **Artifacts** pages.
 
+## Skill Lab
+
+The **Skill Lab** page is the governance surface for your skills:
+
+- **View all skills** with kind, source, and content hash.
+- **Version history** — every distinct content hash is recorded with when it was first seen.
+- **Test runs** — run a skill against pasted sample input; artifacts go to
+  `data/lab-outputs`, never your real note folders.
+- **Provider comparison** — check multiple providers and see outputs side by side.
+- **Score outputs** — good / okay / bad per run.
+- **Golden examples** — save a run's input/output pair (tied to the skill hash that
+  produced it) as regression baseline material.
+- **Preferred provider/model per skill** — saved and used as the Lab default.
+
 ## Providers
 
 - **mock** — always available, deterministic, offline. Remains the default.

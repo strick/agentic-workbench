@@ -17,9 +17,13 @@ export type WorkflowResult = {
   error?: string;
 };
 
+/** What executeWorkflow needs from a workflow definition — WorkflowDef satisfies
+ * it, and the Skill Lab constructs synthetic targets for sandboxed test runs. */
+type RunTarget = Pick<WorkflowDef, 'id' | 'outputType' | 'destination' | 'filenamePattern'>;
+
 function executeWorkflow(args: {
   cfg: Config;
-  def: WorkflowDef;
+  def: RunTarget;
   skill: Skill;
   providerId: string;
   inputSource: string;
@@ -28,6 +32,7 @@ function executeWorkflow(args: {
   label: string;
   sourceRef: string;
   model?: string;
+  comparisonId?: string;
 }): { runId: string; promise: Promise<WorkflowResult> } {
   const { cfg, def, skill, providerId } = args;
   const store = getStore(dataDir(cfg));
@@ -68,6 +73,7 @@ function executeWorkflow(args: {
     cost_usd: 0,
     credits_used: 0,
     prompt,
+    comparison_id: args.comparisonId ?? '',
   });
   store.upsertSkillSighting(skill);
   store.audit('run.started', { runId: run.id, workflow: def.id, skill: skill.name, provider: provider.id, artifactType: def.outputType });
@@ -303,6 +309,44 @@ export async function runWorkflow(cfg: Config, args: WorkflowRunArgs): Promise<W
     sourceRef,
     model: args.model,
   }).promise;
+}
+
+// --- Skill Lab test runs -------------------------------------------------------
+// Sandboxed runs for trying a skill against sample input: same engine and full
+// provenance, but artifacts always land in data/lab-outputs (never in the real
+// output folders) and lab outputs never appear as workflow source files.
+
+function labTarget(skill: Skill): RunTarget {
+  const type = skill.kind && skill.kind !== 'other' ? skill.kind : 'lab-test';
+  return {
+    id: 'skill-lab',
+    outputType: type,
+    destination: { fallbackSubdir: 'lab-outputs' },
+    filenamePattern: `{label}-lab-${skill.id.slice(0, 8)}.md`,
+  };
+}
+
+export type LabRunArgs = { skillId: string; providerId: string; inputText: string; model?: string; comparisonId?: string };
+
+export function startLabRun(cfg: Config, args: LabRunArgs): { runId: string } | { error: string } {
+  const skill = findSkill(cfg, args.skillId);
+  if (!skill) return { error: `Skill not found: ${args.skillId}` };
+  const inputText = args.inputText.trim();
+  if (!inputText) return { error: 'No sample input provided.' };
+  const { runId } = executeWorkflow({
+    cfg,
+    def: labTarget(skill),
+    skill,
+    providerId: args.providerId,
+    inputSource: 'skill-lab',
+    inputText,
+    inputFiles: [],
+    label: new Date().toISOString().slice(0, 10),
+    sourceRef: 'Skill Lab sample input',
+    model: args.model,
+    comparisonId: args.comparisonId,
+  });
+  return { runId };
 }
 
 // --- Inbox -------------------------------------------------------------------

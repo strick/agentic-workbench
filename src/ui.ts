@@ -5,7 +5,7 @@ import { APP_ROOT, type LoadedConfig } from './config.ts';
 import type { PathCheck } from './paths.ts';
 import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
-import type { ArtifactRecord, RunRecord } from './store.ts';
+import type { ArtifactRecord, GoldenExample, RunRecord, SkillPref, SkillVersionRow } from './store.ts';
 import type { SourceFile } from './workflows.ts';
 import { allOutputTypes, type WorkflowDef } from './workflowDefs.ts';
 
@@ -70,6 +70,7 @@ const NAV = [
   ['/', 'Dashboard'],
   ['/settings', 'Settings'],
   ['/skills', 'Skills'],
+  ['/lab', 'Skill Lab'],
   ['/workflows', 'Workflows'],
   ['/runs', 'Runs'],
   ['/artifacts', 'Artifacts'],
@@ -260,6 +261,7 @@ export function pageSkills(d: { skills: Skill[]; skillsDir: string; skillsDirSou
 <td>
   <div class="actions" style="margin:0">
     <button class="secondary" onclick="preview('${esc(s.id)}')">Preview</button>
+    <a href="/lab/skill?id=${esc(s.id)}"><button class="secondary">Lab</button></a>
     <a href="/inbox?skill=${esc(s.id)}"><button>Run</button></a>
   </div>
 </td></tr>
@@ -428,6 +430,177 @@ msg('wfMsg',result.error||'Run failed.',false);
 b.disabled=false;
 });
 }catch(e){msg('wfMsg',e.message,false);b.disabled=false}};
+</script>`);
+}
+
+// --- Skill Lab ---------------------------------------------------------------
+
+const PROVIDER_IDS = ['mock', 'claude-cli', 'copilot-cli'] as const;
+
+export function pageLab(d: {
+  skills: Skill[];
+  versionCounts: Record<string, number>;
+  prefs: Record<string, SkillPref>;
+  goldenCounts: Record<string, number>;
+}): string {
+  const rows = d.skills
+    .map((s) => {
+      const pref = d.prefs[s.id];
+      const provSel = PROVIDER_IDS.map(
+        (p) => `<option value="${p}"${pref?.provider_id === p ? ' selected' : ''}>${p}</option>`,
+      ).join('');
+      return `<tr>
+<td><b><a href="/lab/skill?id=${esc(s.id)}">${esc(s.name)}</a></b><br>
+<span class="dim small">${esc(s.description).slice(0, 110)}</span></td>
+<td><span class="badge b-dim">${esc(s.kind)}</span><br><span class="dim small">${esc(s.source)}</span></td>
+<td class="mono small">${esc(s.shortHash)}<br><span class="dim">v${d.versionCounts[s.id] ?? 1}</span></td>
+<td class="small">${d.goldenCounts[s.id] ?? 0}</td>
+<td>
+  <select id="prov-${esc(s.id)}" style="width:auto">${provSel}</select>
+  <input type="text" id="model-${esc(s.id)}" value="${esc(pref?.model ?? '')}" placeholder="model (optional)" style="width:150px" spellcheck="false">
+  <button class="secondary" onclick="savePref('${esc(s.id)}')">Save</button>
+</td>
+<td><a href="/lab/skill?id=${esc(s.id)}"><button>Open</button></a></td></tr>`;
+    })
+    .join('');
+  return layout('Skill Lab', '/lab', `
+<h1>Skill Lab</h1>
+<p class="dim">Your prompt/skill governance lab: version history, sandboxed test runs, provider comparison,
+golden examples, and output scoring. Lab runs write only to <span class="mono">data/lab-outputs</span> — never
+into your real note folders.</p>
+<div id="labMsg" class="msg"></div>
+<div class="panel"><table>
+<tr><th>Skill</th><th>Kind / source</th><th>Hash / versions</th><th>Golden</th><th>Preferred provider / model</th><th></th></tr>
+${rows || '<tr><td colspan="6" class="dim">No skills found.</td></tr>'}</table></div>
+<script>
+async function savePref(id){try{
+await api('/api/lab/prefs',{method:'POST',body:JSON.stringify({skillId:id,
+providerId:document.getElementById('prov-'+id).value,model:document.getElementById('model-'+id).value.trim()})});
+msg('labMsg','Preference saved.',true)}catch(e){msg('labMsg',e.message,false)}}
+</script>`);
+}
+
+export function pageLabSkill(d: {
+  skill: Skill;
+  versions: SkillVersionRow[];
+  pref: SkillPref | null;
+  golden: GoldenExample[];
+  labRuns: RunRecord[];
+  scores: Record<string, string>;
+}): string {
+  const s = d.skill;
+  const provChecks = PROVIDER_IDS.map((p) => {
+    const checked = d.pref ? d.pref.provider_id === p : p === 'mock';
+    return `<label style="display:inline-block;margin-right:16px;font-weight:400">
+<input type="checkbox" class="provChk" value="${p}"${checked ? ' checked' : ''}> ${p}</label>`;
+  }).join('');
+  const versionRows = d.versions
+    .map((v, i) => `<tr><td class="mono small">${esc(v.hash.slice(0, 16))}${i === 0 ? ' <span class="badge b-info">current</span>' : ''}</td>
+<td class="small dim">${esc(v.seen_at.slice(0, 19).replace('T', ' '))}</td></tr>`)
+    .join('');
+  const goldenRows = d.golden.length
+    ? d.golden
+        .map(
+          (g) => `<tr><td class="small dim">${esc(g.created_at.slice(0, 19).replace('T', ' '))}</td>
+<td class="mono small">${esc(g.skill_hash.slice(0, 12))}</td>
+<td class="small">${esc(g.note || '—')}</td>
+<td><details><summary>input / output</summary>
+<pre style="max-height:200px;overflow:auto">${esc(g.input_text)}</pre>
+<pre style="max-height:300px;overflow:auto">${esc(g.output_text)}</pre></details></td>
+<td><button class="secondary" onclick="delGolden('${esc(g.id)}')">Delete</button></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="dim">No golden examples yet — run a test and save a good output.</td></tr>';
+  const scoreBadge = (sc: string) =>
+    sc ? `<span class="badge ${sc === 'good' ? 'b-ok' : sc === 'okay' ? 'b-warn' : 'b-err'}">${esc(sc)}</span>` : '<span class="dim">—</span>';
+  const runRows2 = d.labRuns.length
+    ? d.labRuns
+        .map(
+          (r) => `<tr><td><a href="/run?id=${esc(r.id)}" class="mono">${esc(r.id.slice(0, 8))}</a></td>
+<td class="mono small">${esc(r.provider_id)}</td><td>${esc(r.status)}</td>
+<td>${scoreBadge(d.scores[r.id] ?? '')}</td>
+<td class="small dim">${esc(r.created_at.slice(0, 19).replace('T', ' '))}</td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="dim">No lab runs yet.</td></tr>';
+
+  return layout(`Lab — ${s.name}`, '/lab', `
+<h1>Skill Lab — ${esc(s.name)}</h1>
+<p class="dim mono small">${esc(s.path)} · hash ${esc(s.shortHash)} · kind ${esc(s.kind)}</p>
+<div class="panel">
+<label for="sampleInput">Sample input</label>
+<textarea id="sampleInput" placeholder="Paste sample input to test this skill against…"></textarea>
+<label>Providers <span class="dim">(pick several to compare outputs side by side)</span></label>
+<div>${provChecks}</div>
+<div class="row">${MODEL_FIELD}</div>
+<div class="actions"><button id="runBtn">Run test</button></div>
+<div id="labMsg" class="msg"></div>
+<label>Live output</label>
+<pre id="livePane" style="display:none;max-height:240px;overflow:auto"></pre>
+<div id="results"></div>
+</div>
+<h2>Version history</h2>
+<div class="panel"><table><tr><th>Content hash</th><th>First seen</th></tr>${versionRows ||
+    '<tr><td colspan="2" class="dim">No versions recorded yet.</td></tr>'}</table></div>
+<h2>Golden examples</h2>
+<div class="panel"><table><tr><th>Saved</th><th>Skill hash</th><th>Note</th><th>Content</th><th></th></tr>${goldenRows}</table></div>
+<h2>Recent lab runs</h2>
+<div class="panel"><table><tr><th>Run</th><th>Provider</th><th>Status</th><th>Score</th><th>Created</th></tr>${runRows2}</table></div>
+<script>
+${MODEL_JS}
+const SKILL_ID='${esc(s.id)}';
+function scoreBtns(runId){return ['good','okay','bad'].map(v=>
+'<button class="secondary" onclick="scoreRun(\\''+runId+'\\',\\''+v+'\\',this)">'+v+'</button>').join(' ')}
+async function scoreRun(runId,val,btn){try{
+await api('/api/runs/score',{method:'POST',body:JSON.stringify({runId,score:val})});
+btn.parentElement.querySelectorAll('button').forEach(b=>b.style.outline='');
+btn.style.outline='2px solid var(--accent)';msg('labMsg','Scored '+val+'.',true)}catch(e){msg('labMsg',e.message,false)}}
+async function saveGolden(runId,btn){try{
+await api('/api/lab/golden',{method:'POST',body:JSON.stringify({skillId:SKILL_ID,runId})});
+btn.disabled=true;btn.textContent='Saved ✓';msg('labMsg','Golden example saved.',true)}catch(e){msg('labMsg',e.message,false)}}
+async function delGolden(id){try{
+await api('/api/lab/golden/delete',{method:'POST',body:JSON.stringify({id})});
+msg('labMsg','Deleted — reloading…',true);setTimeout(()=>location.reload(),500)}catch(e){msg('labMsg',e.message,false)}}
+function resultCard(r,content){
+return '<h2>'+r.provider_id+' — '+r.status+(r.durationMs!=null?' ('+(r.durationMs/1000).toFixed(1)+'s)':'')+'</h2>'+
+'<div class="panel">'+(r.status==='completed'
+?'<div class="actions" style="margin-top:0">'+scoreBtns(r.id)+' <button class="secondary" onclick="saveGolden(\\''+r.id+'\\',this)">Save as golden</button>'+
+' <a href="/run?id='+r.id+'">view run</a></div><pre style="max-height:340px;overflow:auto">'+content.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre>'
+:'<p class="dim">'+(r.error||r.status)+'</p>')+'</div>'}
+async function renderResults(runs){
+let html='';
+for(const r of runs){
+let content='';
+if(r.status==='completed'&&r.output_artifact_path){
+try{const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.output_artifact_path));content=pv.content}catch(e){content='(unreadable)'}}
+html+=resultCard(r,content)}
+document.getElementById('results').innerHTML=html}
+document.getElementById('runBtn').onclick=async()=>{
+const b=document.getElementById('runBtn');b.disabled=true;
+document.getElementById('results').innerHTML='';
+const provs=[...document.querySelectorAll('.provChk:checked')].map(c=>c.value);
+const live=document.getElementById('livePane');live.textContent='';live.style.display=provs.length===1?'':'none';
+msg('labMsg','Running against '+provs.join(', ')+'…',true);
+try{
+const body={skillId:SKILL_ID,providerIds:provs,inputText:document.getElementById('sampleInput').value,model:modelVal()};
+const r=await api('/api/lab/run',{method:'POST',body:JSON.stringify(body)});
+if(provs.length===1){
+const runId=r.runs[0].runId;
+const es=new EventSource('/api/runs/'+runId+'/stream');
+es.onmessage=(ev)=>{try{live.textContent+=JSON.parse(ev.data)+'\\n';live.scrollTop=live.scrollHeight}catch{}};
+es.addEventListener('done',async()=>{es.close();
+const rr=(await api('/api/runs')).runs.find(x=>x.id===runId);
+if(rr)await renderResults([{...rr,durationMs:rr.completed_at?new Date(rr.completed_at)-new Date(rr.created_at):null}]);
+msg('labMsg','Run finished.',rr&&rr.status==='completed');b.disabled=false});
+}else{
+const poll=setInterval(async()=>{
+const cr=await api('/api/lab/comparison?id='+r.comparisonId);
+if(cr.runs.length&&cr.runs.every(x=>x.status!=='running')){
+clearInterval(poll);await renderResults(cr.runs);
+msg('labMsg','Comparison finished.',true);b.disabled=false}
+},1500);
+}
+}catch(e){msg('labMsg',e.message,false);b.disabled=false}};
 </script>`);
 }
 
