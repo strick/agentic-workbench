@@ -21,6 +21,7 @@ import { getStore } from './store.ts';
 import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkflowRun } from './workflows.ts';
 import { executeApproval, proposeGitCommit, proposeObsidianWrite } from './actions.ts';
 import { listEvalSuites, runEvalSuite } from './evals.ts';
+import { latestBrief, writeBrief } from './brief.ts';
 import { ARCHITECTURE_MODE, allowedWorkflows, getWorkflow, modeWorkflows } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
@@ -346,6 +347,13 @@ const routes: Record<string, Handler> = {
     store.scoreRun(run.id, run.skill_id, args.score, args.note);
     store.audit('run.scored', { runId: run.id, score: args.score });
     return { json: { ok: true } };
+  },
+
+  'GET /brief': async ({ cfg }) => ({ html: ui.pageBrief({ latest: latestBrief(cfg) }) }),
+
+  'POST /api/brief': async ({ cfg }) => {
+    const { path: written } = writeBrief(cfg);
+    return { json: { ok: true, path: written } };
   },
 
   'GET /evals': async ({ cfg }) => {

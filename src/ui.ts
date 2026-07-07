@@ -69,6 +69,7 @@ details summary{cursor:pointer;color:var(--accent)}
 
 const NAV = [
   ['/', 'Dashboard'],
+  ['/brief', 'Brief'],
   ['/settings', 'Settings'],
   ['/skills', 'Skills'],
   ['/lab', 'Skill Lab'],
@@ -772,6 +773,28 @@ ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` 
 <h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>
 <h2>Prompt</h2>
 <div class="panel"><details><summary>Full prompt sent to model</summary><pre>${esc(r.prompt || '(not recorded)')}</pre></details></div>`);
+}
+
+// --- Morning Brief -----------------------------------------------------------
+
+export function pageBrief(d: { latest: { name: string; content: string } | null }): string {
+  return layout('Morning Brief', '/brief', `
+<h1>Morning Brief</h1>
+<p class="dim">A local, read-only synthesis of your notes: yesterday's work, today's focus, who you're waiting on,
+architecture risks, decisions needed, and a draft standup line. No AI provider involved — pure extraction, so it
+also runs offline via <span class="mono">npm run brief</span> (or continuously via <span class="mono">npm run watch</span>).</p>
+<div class="actions"><button id="genBtn">Generate fresh brief</button></div>
+<div id="brMsg" class="msg"></div>
+${d.latest
+    ? `<h2>Latest — <span class="mono">${esc(d.latest.name)}</span></h2><div class="panel"><pre>${esc(d.latest.content)}</pre></div>`
+    : '<div class="panel dim">No brief generated yet — click the button above.</div>'}
+<script>
+document.getElementById('genBtn').onclick=async()=>{
+const b=document.getElementById('genBtn');b.disabled=true;
+try{const r=await api('/api/brief',{method:'POST'});
+msg('brMsg','Brief written to '+r.path+' — reloading…',true);setTimeout(()=>location.reload(),700);
+}catch(e){msg('brMsg',e.message,false);b.disabled=false}};
+</script>`);
 }
 
 // --- Evals -------------------------------------------------------------------

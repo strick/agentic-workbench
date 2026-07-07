@@ -159,6 +159,27 @@ of the workflows an AI architect produces in a working week:
 Each has a bundled example skill (frontmatter `kind:` matches it to the
 workflow); your own skills of the same kind are preferred automatically.
 
+## Morning Brief / background mode
+
+```bash
+npm run brief   # one-shot: print + write data/briefs/YYYY-MM-DD-brief.md
+npm run watch   # background: regenerate the brief whenever notes change
+```
+
+The brief is a **local, read-only synthesis** — no AI provider involved:
+
+| Brief section | Source |
+|---|---|
+| Yesterday | latest daily log (executive summary + work completed) |
+| Today's focus | open follow-ups from recent logs |
+| Waiting on | people/stakeholder lines + waiting/blocked/ping items |
+| Architecture risks | risk sections + generated risk registers |
+| Decisions needed | decision extractor outputs + ownership gaps |
+| Draft standup line | composed from the above |
+
+Also available in the UI at **Brief** (view latest / generate fresh). The only
+write is the brief file itself; deliberately no email/calendar integration yet.
+
 ## Evals
 
 The **Evals** page runs fixture-based checks against a skill + provider. Suites
