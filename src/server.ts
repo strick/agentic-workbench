@@ -9,6 +9,7 @@ if (nodeMajor < 24) {
 }
 
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -17,7 +18,7 @@ import { allowedReadRoots, checkAllPaths, isPathAllowed } from './paths.ts';
 import { loadSkills } from './skills.ts';
 import { getProviders } from './providers/index.ts';
 import { getStore } from './store.ts';
-import { listInboxNotes, listSourceFiles, saveInboxNote, startWorkflowRun } from './workflows.ts';
+import { listInboxNotes, listSourceFiles, saveInboxNote, startLabRun, startWorkflowRun } from './workflows.ts';
 import { allowedWorkflows, getWorkflow } from './workflowDefs.ts';
 import { getRunStream } from './runStream.ts';
 import * as ui from './ui.ts';
@@ -77,6 +78,27 @@ const WorkflowRunSchema = z.object({
   model: ModelSchema,
 });
 const InboxSchema = z.object({ text: z.string().min(1, 'Note text is empty.') });
+const LabRunSchema = z.object({
+  skillId: z.string().min(1),
+  providerIds: z.array(z.string().min(1)).min(1, 'Pick at least one provider.'),
+  inputText: z.string().min(1, 'Sample input is empty.'),
+  model: ModelSchema,
+});
+const SkillPrefSchema = z.object({
+  skillId: z.string().min(1),
+  providerId: z.string().min(1),
+  model: z
+    .string()
+    .regex(/^[A-Za-z0-9._:-]{0,64}$/, 'Model may only contain letters, digits, . _ : -')
+    .default(''),
+});
+const GoldenSchema = z.object({ skillId: z.string().min(1), runId: z.string().min(1), note: z.string().default('') });
+const GoldenDeleteSchema = z.object({ id: z.string().min(1) });
+const ScoreSchema = z.object({
+  runId: z.string().min(1),
+  score: z.enum(['good', 'okay', 'bad']),
+  note: z.string().default(''),
+});
 
 // --- Route handlers ----------------------------------------------------------
 type Handler = (ctx: Ctx) => Promise<{ status?: number; html?: string; json?: unknown; redirect?: string }>;
@@ -140,6 +162,119 @@ const routes: Record<string, Handler> = {
   'GET /inbox': async ({ url }) => ({ redirect: `/workflow?id=daily-log${url.searchParams.get('skill') ? `&skill=${url.searchParams.get('skill')}` : ''}` }),
   'GET /weekly': async () => ({ redirect: '/workflow?id=weekly-report' }),
   'GET /wiki': async () => ({ redirect: '/workflow?id=wiki-source' }),
+
+  'GET /lab': async ({ cfg }) => {
+    const { skills } = loadSkills(cfg);
+    const store = getStore(dataDir(cfg));
+    const versionCounts: Record<string, number> = {};
+    for (const s of skills) {
+      store.upsertSkillSighting(s);
+      versionCounts[s.id] = store.skillVersionCount(s.id);
+    }
+    const prefs = Object.fromEntries(store.listSkillPrefs().map((p) => [p.skill_id, p]));
+    const goldenCounts: Record<string, number> = {};
+    for (const g of store.listGoldenExamples()) goldenCounts[g.skill_id] = (goldenCounts[g.skill_id] ?? 0) + 1;
+    return { html: ui.pageLab({ skills, versionCounts, prefs, goldenCounts }) };
+  },
+
+  'GET /lab/skill': async ({ cfg, url }) => {
+    const { skills } = loadSkills(cfg);
+    const skill = skills.find((s) => s.id === url.searchParams.get('id'));
+    if (!skill) return { redirect: '/lab' };
+    const store = getStore(dataDir(cfg));
+    store.upsertSkillSighting(skill);
+    const labRuns = store.listRuns(500).filter((r) => r.skill_id === skill.id && r.input_source === 'skill-lab').slice(0, 20);
+    const scores = Object.fromEntries(labRuns.map((r) => [r.id, store.getRunScore(r.id)?.score ?? '']));
+    return {
+      html: ui.pageLabSkill({
+        skill,
+        versions: store.listSkillVersions(skill.id),
+        pref: store.getSkillPref(skill.id),
+        golden: store.listGoldenExamples(skill.id),
+        labRuns,
+        scores,
+      }),
+    };
+  },
+
+  'POST /api/lab/run': async ({ cfg, body }) => {
+    const args = LabRunSchema.parse(body ?? {});
+    const providerIds = [...new Set(args.providerIds)];
+    const comparisonId = providerIds.length > 1 ? crypto.randomUUID() : '';
+    const runs: Array<{ providerId: string; runId: string }> = [];
+    for (const providerId of providerIds) {
+      const result = startLabRun(cfg, { skillId: args.skillId, providerId, inputText: args.inputText, model: args.model, comparisonId });
+      if ('error' in result) return { status: 400, json: result };
+      runs.push({ providerId, runId: result.runId });
+    }
+    return { status: 202, json: { comparisonId, runs } };
+  },
+
+  'GET /api/lab/comparison': async ({ cfg, url }) => {
+    const store = getStore(dataDir(cfg));
+    const runs = store.listRunsByComparison(url.searchParams.get('id') ?? '');
+    return {
+      json: {
+        runs: runs.map((r) => ({
+          ...r,
+          score: store.getRunScore(r.id)?.score ?? '',
+          durationMs: r.completed_at ? new Date(r.completed_at).getTime() - new Date(r.created_at).getTime() : null,
+        })),
+      },
+    };
+  },
+
+  'POST /api/lab/prefs': async ({ cfg, body }) => {
+    const args = SkillPrefSchema.parse(body ?? {});
+    const store = getStore(dataDir(cfg));
+    store.setSkillPref(args.skillId, args.providerId, args.model);
+    store.audit('skill.pref_set', { skillId: args.skillId, providerId: args.providerId, model: args.model });
+    return { json: { ok: true } };
+  },
+
+  'POST /api/lab/golden': async ({ cfg, body }) => {
+    const args = GoldenSchema.parse(body ?? {});
+    const store = getStore(dataDir(cfg));
+    const run = store.getRun(args.runId);
+    if (!run) return { status: 404, json: { error: 'Run not found.' } };
+    if (run.status !== 'completed' || !run.output_artifact_path) {
+      return { status: 400, json: { error: 'Only completed runs with an artifact can become golden examples.' } };
+    }
+    let output = '';
+    try {
+      output = readAllowedFile(cfg, run.output_artifact_path);
+    } catch (e) {
+      return { status: 400, json: { error: `Artifact not readable: ${(e as Error).message}` } };
+    }
+    const golden = store.addGoldenExample({
+      skill_id: run.skill_id,
+      skill_hash: run.skill_hash,
+      run_id: run.id,
+      input_text: run.input_text,
+      output_text: output,
+      note: args.note,
+    });
+    store.audit('skill.golden_saved', { skillId: run.skill_id, runId: run.id, goldenId: golden.id });
+    return { json: { ok: true, id: golden.id } };
+  },
+
+  'POST /api/lab/golden/delete': async ({ cfg, body }) => {
+    const { id } = GoldenDeleteSchema.parse(body ?? {});
+    const store = getStore(dataDir(cfg));
+    store.deleteGoldenExample(id);
+    store.audit('skill.golden_deleted', { goldenId: id });
+    return { json: { ok: true } };
+  },
+
+  'POST /api/runs/score': async ({ cfg, body }) => {
+    const args = ScoreSchema.parse(body ?? {});
+    const store = getStore(dataDir(cfg));
+    const run = store.getRun(args.runId);
+    if (!run) return { status: 404, json: { error: 'Run not found.' } };
+    store.scoreRun(run.id, run.skill_id, args.score, args.note);
+    store.audit('run.scored', { runId: run.id, score: args.score });
+    return { json: { ok: true } };
+  },
 
   'GET /runs': async ({ cfg }) => {
     const store = getStore(dataDir(cfg));

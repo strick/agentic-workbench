@@ -35,7 +35,37 @@ export type RunRecord = {
   cost_usd: number; // real cost reported by the CLI, 0 if unknown/not applicable
   credits_used: number; // GitHub Copilot premium-request credits ($0.10/credit), 0 if unknown/not applicable
   prompt: string; // full composed prompt (skill markdown + input block) sent to the provider
+  comparison_id: string; // groups runs launched together for provider comparison ('' if standalone)
 };
+
+export type SkillPref = {
+  skill_id: string;
+  provider_id: string;
+  model: string;
+  updated_at: string;
+};
+
+export type GoldenExample = {
+  id: string;
+  skill_id: string;
+  skill_hash: string; // skill version the example was captured against
+  run_id: string;
+  input_text: string;
+  output_text: string;
+  note: string;
+  created_at: string;
+};
+
+export type RunScore = {
+  id: string;
+  run_id: string;
+  skill_id: string;
+  score: 'good' | 'okay' | 'bad';
+  note: string;
+  created_at: string;
+};
+
+export type SkillVersionRow = { id: string; skill_id: string; hash: string; seen_at: string };
 
 export type ArtifactRecord = {
   id: string;
@@ -76,6 +106,16 @@ CREATE TABLE IF NOT EXISTS approvals (
 CREATE TABLE IF NOT EXISTS audit_events (
   id TEXT PRIMARY KEY, ts TEXT, event_type TEXT, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS skill_prefs (
+  skill_id TEXT PRIMARY KEY, provider_id TEXT, model TEXT, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS golden_examples (
+  id TEXT PRIMARY KEY, skill_id TEXT, skill_hash TEXT, run_id TEXT,
+  input_text TEXT, output_text TEXT, note TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS run_scores (
+  id TEXT PRIMARY KEY, run_id TEXT, skill_id TEXT, score TEXT, note TEXT, created_at TEXT
+);
 `;
 
 const JSON_TABLES = [
@@ -87,6 +127,9 @@ const JSON_TABLES = [
   'config_paths',
   'approvals',
   'audit_events',
+  'skill_prefs',
+  'golden_examples',
+  'run_scores',
 ] as const;
 type TableName = (typeof JSON_TABLES)[number];
 
@@ -122,6 +165,7 @@ export class Store {
         `ALTER TABLE runs ADD COLUMN cost_usd REAL DEFAULT 0`,
         `ALTER TABLE runs ADD COLUMN credits_used REAL DEFAULT 0`,
         `ALTER TABLE runs ADD COLUMN prompt TEXT DEFAULT ''`,
+        `ALTER TABLE runs ADD COLUMN comparison_id TEXT DEFAULT ''`,
       ]) {
         try {
           this.db.exec(stmt);
@@ -161,7 +205,12 @@ export class Store {
       this.db.prepare(sql).run(...keys.map((k) => row[k]));
     } else {
       const rows = this.jsonData![table];
-      const idx = rows.findIndex((r) => r.id === row.id || (table === 'config_paths' && r.key === row.key));
+      const idx = rows.findIndex(
+        (r) =>
+          r.id === row.id ||
+          (table === 'config_paths' && r.key === row.key) ||
+          (table === 'skill_prefs' && r.skill_id === row.skill_id),
+      );
       if (idx >= 0) rows[idx] = row;
       else rows.push(row);
       this.saveJson();
@@ -184,6 +233,15 @@ export class Store {
   private selectAll(table: TableName): Record<string, unknown>[] {
     if (this.db) return this.db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
     return [...this.jsonData![table]];
+  }
+
+  private deleteById(table: TableName, id: string): void {
+    if (this.db) {
+      this.db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
+    } else {
+      this.jsonData![table] = this.jsonData![table].filter((r) => r.id !== id);
+      this.saveJson();
+    }
   }
 
   // --- domain methods -------------------------------------------------------
@@ -293,6 +351,7 @@ export class Store {
       cost_usd: Number(r.cost_usd ?? 0),
       credits_used: Number(r.credits_used ?? 0),
       prompt: String(r.prompt ?? ''),
+      comparison_id: String(r.comparison_id ?? ''),
     };
   }
 
@@ -322,6 +381,68 @@ export class Store {
 
   getArtifact(id: string): ArtifactRecord | null {
     return (this.selectAll('artifacts') as unknown as ArtifactRecord[]).find((a) => a.id === id) ?? null;
+  }
+
+  // --- Skill Lab: version history, prefs, golden examples, scores -----------
+  listSkillVersions(skillId: string): SkillVersionRow[] {
+    return (this.selectAll('skill_versions') as unknown as SkillVersionRow[])
+      .filter((v) => v.skill_id === skillId)
+      .sort((a, b) => (a.seen_at < b.seen_at ? 1 : -1));
+  }
+
+  setSkillPref(skillId: string, providerId: string, model: string): void {
+    this.insert('skill_prefs', { skill_id: skillId, provider_id: providerId, model, updated_at: now() });
+  }
+
+  getSkillPref(skillId: string): SkillPref | null {
+    return (this.selectAll('skill_prefs') as unknown as SkillPref[]).find((p) => p.skill_id === skillId) ?? null;
+  }
+
+  listSkillPrefs(): SkillPref[] {
+    return this.selectAll('skill_prefs') as unknown as SkillPref[];
+  }
+
+  addGoldenExample(g: Omit<GoldenExample, 'id' | 'created_at'>): GoldenExample {
+    const full: GoldenExample = { ...g, id: crypto.randomUUID(), created_at: now() };
+    this.insert('golden_examples', { ...full });
+    return full;
+  }
+
+  listGoldenExamples(skillId?: string): GoldenExample[] {
+    return (this.selectAll('golden_examples') as unknown as GoldenExample[])
+      .filter((g) => !skillId || g.skill_id === skillId)
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+  }
+
+  getGoldenExample(id: string): GoldenExample | null {
+    return (this.selectAll('golden_examples') as unknown as GoldenExample[]).find((g) => g.id === id) ?? null;
+  }
+
+  deleteGoldenExample(id: string): void {
+    this.deleteById('golden_examples', id);
+  }
+
+  /** Upserts a score for a run (id = run id, so re-scoring replaces). */
+  scoreRun(runId: string, skillId: string, score: RunScore['score'], note: string): RunScore {
+    const full: RunScore = { id: runId, run_id: runId, skill_id: skillId, score, note, created_at: now() };
+    this.insert('run_scores', { ...full });
+    return full;
+  }
+
+  getRunScore(runId: string): RunScore | null {
+    return (this.selectAll('run_scores') as unknown as RunScore[]).find((s) => s.run_id === runId) ?? null;
+  }
+
+  listRunScores(): RunScore[] {
+    return this.selectAll('run_scores') as unknown as RunScore[];
+  }
+
+  listRunsByComparison(comparisonId: string): RunRecord[] {
+    if (!comparisonId) return []; // '' marks standalone runs — never a group
+    return this.selectAll('runs')
+      .filter((r) => String(r.comparison_id ?? '') === comparisonId)
+      .map((r) => this.rowToRun(r))
+      .sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
   }
 }
 
