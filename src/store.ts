@@ -437,6 +437,39 @@ export class Store {
     return this.selectAll('run_scores') as unknown as RunScore[];
   }
 
+  /** Past comparison groups, newest first: one summary row per comparison_id. */
+  listComparisons(limit = 20): Array<{
+    comparison_id: string;
+    created_at: string;
+    skill_name: string;
+    input_source: string;
+    providers: string[];
+    statuses: string[];
+  }> {
+    const groups = new Map<string, RunRecord[]>();
+    for (const row of this.selectAll('runs')) {
+      const cid = String(row.comparison_id ?? '');
+      if (!cid) continue;
+      const run = this.rowToRun(row);
+      if (!groups.has(cid)) groups.set(cid, []);
+      groups.get(cid)!.push(run);
+    }
+    return [...groups.entries()]
+      .map(([comparison_id, runs]) => {
+        runs.sort((a, b) => (a.created_at > b.created_at ? 1 : -1));
+        return {
+          comparison_id,
+          created_at: runs[0].created_at,
+          skill_name: runs[0].skill_name,
+          input_source: runs[0].input_source,
+          providers: runs.map((r) => r.provider_id),
+          statuses: runs.map((r) => r.status),
+        };
+      })
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+      .slice(0, limit);
+  }
+
   listRunsByComparison(comparisonId: string): RunRecord[] {
     if (!comparisonId) return []; // '' marks standalone runs — never a group
     return this.selectAll('runs')

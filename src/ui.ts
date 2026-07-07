@@ -71,6 +71,7 @@ const NAV = [
   ['/settings', 'Settings'],
   ['/skills', 'Skills'],
   ['/lab', 'Skill Lab'],
+  ['/shootout', 'Shootout'],
   ['/workflows', 'Workflows'],
   ['/runs', 'Runs'],
   ['/artifacts', 'Artifacts'],
@@ -601,6 +602,104 @@ msg('labMsg','Comparison finished.',true);b.disabled=false}
 },1500);
 }
 }catch(e){msg('labMsg',e.message,false);b.disabled=false}};
+</script>`);
+}
+
+// --- Provider Shootout ---------------------------------------------------------
+
+export function pageShootout(d: {
+  skills: Skill[];
+  providers: Array<{ id: string; name: string; capabilities: string[] } & ProviderHealth>;
+  defaultProvider: string;
+  history: Array<{ comparison_id: string; created_at: string; skill_name: string; input_source: string; providers: string[]; statuses: string[] }>;
+}): string {
+  const provChecks = d.providers
+    .map(
+      (p) => `<label style="display:inline-block;margin-right:18px;font-weight:400">
+<input type="checkbox" class="provChk" value="${esc(p.id)}"${p.id === 'mock' || p.healthy ? ' checked' : ''}> ${esc(p.id)}
+${p.healthy ? '<span class="badge b-ok">available</span>' : '<span class="badge b-warn">unavailable</span>'}</label>`,
+    )
+    .join('');
+  const historyRows = d.history.length
+    ? d.history
+        .map(
+          (h) => `<tr><td class="small dim">${esc(h.created_at.slice(0, 19).replace('T', ' '))}</td>
+<td>${esc(h.skill_name)}</td><td class="mono small">${h.providers.map(esc).join(', ')}</td>
+<td class="small">${h.statuses.map((s) => statusBadge(s)).join(' ')}</td>
+<td><a href="/shootout?cid=${esc(h.comparison_id)}">view</a></td></tr>`,
+        )
+        .join('')
+    : '<tr><td colspan="5" class="dim">No shootouts yet.</td></tr>';
+
+  return layout('Shootout', '/shootout', `
+<h1>Provider Shootout</h1>
+<p class="dim">Run the <b>same input through the same skill</b> on multiple providers and compare time, output,
+and cost — so you know which model is worth spending on for which task. Artifacts land in
+<span class="mono">data/shootouts</span>.</p>
+<div class="panel">
+<label for="inputText">Input note</label>
+<textarea id="inputText" placeholder="Paste the input to run through every provider…"></textarea>
+<div class="row">
+  <div><label for="skillSel">Skill</label><select id="skillSel">${skillOptions(d.skills, 'daily-log')}</select></div>
+  ${MODEL_FIELD}
+</div>
+<label>Providers</label>
+<div>${provChecks}</div>
+<div class="actions"><button id="runBtn">Run Shootout</button></div>
+<div id="soMsg" class="msg"></div>
+</div>
+<div id="resultsWrap" style="display:none">
+<h2>Results</h2>
+<div class="panel"><table id="resultsTable">
+<tr><th>Provider</th><th>Time</th><th>Status</th><th>Output length</th><th>Cost</th><th>Score</th><th>Artifact</th></tr>
+</table></div>
+<div id="outputs"></div>
+</div>
+<h2>Past shootouts</h2>
+<div class="panel"><table><tr><th>When</th><th>Skill</th><th>Providers</th><th>Statuses</th><th></th></tr>${historyRows}</table></div>
+<script>
+${MODEL_JS}
+function escHtml(t){return (t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+async function scoreRun(runId,val,btn){try{
+await api('/api/runs/score',{method:'POST',body:JSON.stringify({runId,score:val})});
+btn.parentElement.querySelectorAll('button').forEach(b=>b.style.outline='');
+btn.style.outline='2px solid var(--accent)';msg('soMsg','Scored '+val+'.',true)}catch(e){msg('soMsg',e.message,false)}}
+async function renderComparison(cid){
+const cr=await api('/api/lab/comparison?id='+cid);
+if(!cr.runs.length){msg('soMsg','Comparison not found.',false);return false}
+const done=cr.runs.every(r=>r.status!=='running');
+const tbl=document.getElementById('resultsTable');
+tbl.innerHTML='<tr><th>Provider</th><th>Time</th><th>Status</th><th>Output length</th><th>Cost</th><th>Score</th><th>Artifact</th></tr>'+
+cr.runs.map(r=>'<tr><td class="mono">'+r.provider_id+(r.model_used?' <span class="dim small">('+r.model_used+')</span>':'')+'</td>'+
+'<td>'+(r.durationMs!=null?(r.durationMs/1000).toFixed(1)+'s':'…')+'</td>'+
+'<td>'+r.status+'</td>'+
+'<td>'+(r.outputLength!=null?r.outputLength+' B':'—')+'</td>'+
+'<td>'+(r.cost_usd?'$'+r.cost_usd.toFixed(4):'—')+'</td>'+
+'<td>'+(r.status==='completed'?['good','okay','bad'].map(v=>'<button class="secondary" onclick="scoreRun(\\''+r.id+'\\',\\''+v+'\\',this)"'+(r.score===v?' style="outline:2px solid var(--accent)"':'')+'>'+v+'</button>').join(' '):'—')+'</td>'+
+'<td>'+(r.output_artifact_path?'<a href="/run?id='+r.id+'">view run</a>':(r.error?'<span class="small" style="color:var(--err)">'+escHtml(r.error.slice(0,60))+'</span>':'—'))+'</td></tr>').join('');
+let out='';
+for(const r of cr.runs){
+if(r.status==='completed'&&r.output_artifact_path){
+try{const pv=await api('/api/artifacts/content?path='+encodeURIComponent(r.output_artifact_path));
+out+='<h2>'+r.provider_id+'</h2><div class="panel"><pre style="max-height:340px;overflow:auto">'+escHtml(pv.content)+'</pre></div>'}catch(e){}}}
+document.getElementById('outputs').innerHTML=out;
+document.getElementById('resultsWrap').style.display='';
+return done}
+document.getElementById('runBtn').onclick=async()=>{
+const b=document.getElementById('runBtn');b.disabled=true;
+try{
+const provs=[...document.querySelectorAll('.provChk:checked')].map(c=>c.value);
+const body={skillId:document.getElementById('skillSel').value,providerIds:provs,
+inputText:document.getElementById('inputText').value,model:modelVal()};
+const r=await api('/api/shootout',{method:'POST',body:JSON.stringify(body)});
+msg('soMsg','Shootout running on '+provs.join(', ')+'…',true);
+const poll=setInterval(async()=>{
+try{if(await renderComparison(r.comparisonId)){clearInterval(poll);msg('soMsg','Shootout finished.',true);b.disabled=false}}
+catch(e){clearInterval(poll);msg('soMsg',e.message,false);b.disabled=false}
+},1500);
+}catch(e){msg('soMsg',e.message,false);b.disabled=false}};
+const cid=new URLSearchParams(location.search).get('cid');
+if(cid)renderComparison(cid);
 </script>`);
 }
 

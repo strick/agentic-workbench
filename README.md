@@ -138,6 +138,14 @@ The **Skill Lab** page is the governance surface for your skills:
   produced it) as regression baseline material.
 - **Preferred provider/model per skill** — saved and used as the Lab default.
 
+## Provider Shootout
+
+The **Shootout** page runs the same input through the same skill on multiple
+providers (mock / Claude CLI / Copilot CLI) and shows a comparison table —
+time, status, output length, cost, score, artifact — plus the full outputs side
+by side. Past shootouts are kept and re-viewable. Use it to learn which model is
+worth spending on for which task. Artifacts land in `data/shootouts`.
+
 ## Providers
 
 - **mock** — always available, deterministic, offline. Remains the default.
