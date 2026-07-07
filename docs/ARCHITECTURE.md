@@ -118,6 +118,15 @@ output captured against the skill hash that produced them). Lab runs reuse the
 normal workflow engine and provenance but always write to `data/lab-outputs`,
 and lab outputs never appear as workflow source files.
 
+## Modes
+
+A `WorkbenchMode` (`workflowDefs.ts`) is a curated, purpose-named bundle of
+workflow ids — a lens over the same engine, not a separate code path. The first
+mode is the **AI Architecture Workbench** (`/architecture`): logs, reports,
+decision/risk extraction, ADRs, review packets, backlog breakdown, Microsoft
+alignment review, talk tracks, canon updates. Future project profiles can
+declare their own bundles.
+
 ## Provider Shootout
 
 `/shootout` launches the same skill + input across ≥2 providers concurrently

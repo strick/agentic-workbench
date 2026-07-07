@@ -175,6 +175,96 @@ export const WORKFLOWS: WorkflowDef[] = [
     builtIn: true,
   },
   {
+    id: 'decision-extractor',
+    name: 'Decision Extractor',
+    description: 'Pull every decision — made and needed — out of work logs and notes.',
+    category: 'architecture',
+    skillKind: 'decision-extract',
+    inputSource: {
+      kind: 'text-or-files',
+      fileTypes: ['daily-log', 'weekly-report', 'wiki-source', 'canon-note'],
+      label: 'Work logs and/or pasted notes to mine for decisions',
+    },
+    outputType: 'decision-list',
+    destination: { fallbackSubdir: 'decisions' },
+    filenamePattern: '{label}-decisions.md',
+    dateMode: 'date',
+    approvalRule: 'none',
+    builtIn: true,
+  },
+  {
+    id: 'risk-extractor',
+    name: 'Risk Extractor',
+    description: 'Surface risks, blockers, and ownership gaps from work logs and notes.',
+    category: 'architecture',
+    skillKind: 'risk-extract',
+    inputSource: {
+      kind: 'text-or-files',
+      fileTypes: ['daily-log', 'weekly-report', 'wiki-source', 'canon-note'],
+      label: 'Work logs and/or pasted notes to mine for risks',
+    },
+    outputType: 'risk-register',
+    destination: { fallbackSubdir: 'risks' },
+    filenamePattern: '{label}-risks.md',
+    dateMode: 'date',
+    approvalRule: 'none',
+    builtIn: true,
+  },
+  {
+    id: 'roadmap-to-backlog',
+    name: 'Roadmap to Backlog',
+    description: 'Break a roadmap or initiative into epics, features, and thin slices.',
+    category: 'architecture',
+    skillKind: 'backlog',
+    inputSource: {
+      kind: 'text-or-files',
+      fileTypes: ['canon-note', 'adr', 'review-packet'],
+      label: 'Roadmap / initiative notes (pasted) and/or architecture docs',
+    },
+    outputType: 'backlog',
+    destination: { fallbackSubdir: 'backlogs' },
+    filenamePattern: '{label}-backlog.md',
+    dateMode: 'date',
+    approvalRule: 'none',
+    builtIn: true,
+  },
+  {
+    id: 'microsoft-alignment',
+    name: 'Microsoft Alignment Review',
+    description: 'Review plans against the Microsoft AI stack: Foundry, Copilot, APIM, MCP, Entra.',
+    category: 'architecture',
+    skillKind: 'alignment-review',
+    inputSource: {
+      kind: 'text-or-files',
+      fileTypes: ['daily-log', 'weekly-report', 'canon-note', 'adr', 'review-packet'],
+      label: 'Architecture plans/notes to review for Microsoft-stack alignment',
+    },
+    outputType: 'alignment-review',
+    destination: { fallbackSubdir: 'alignment-reviews' },
+    filenamePattern: '{label}-alignment-review.md',
+    dateMode: 'date',
+    approvalRule: 'none',
+    builtIn: true,
+  },
+  {
+    id: 'talk-track',
+    name: 'Talk Track Builder',
+    description: 'Turn work notes into short, ready-to-say meeting language.',
+    category: 'architecture',
+    skillKind: 'talk-track',
+    inputSource: {
+      kind: 'text-or-files',
+      fileTypes: ['daily-log', 'weekly-report', 'decision-list', 'risk-register'],
+      label: 'Notes and/or recent logs to turn into meeting language',
+    },
+    outputType: 'talk-track',
+    destination: { fallbackSubdir: 'talk-tracks' },
+    filenamePattern: '{label}-talk-track.md',
+    dateMode: 'date',
+    approvalRule: 'none',
+    builtIn: true,
+  },
+  {
     id: 'fable-output-qa',
     name: 'Fable Output QA',
     description: 'Critique AI-generated docs and produce an improvement plan.',
@@ -211,4 +301,49 @@ export function allOutputTypes(): string[] {
 /** All the workflows allowed for a config (hook for future per-profile allow-lists). */
 export function allowedWorkflows(_cfg: Config): WorkflowDef[] {
   return WORKFLOWS;
+}
+
+// --- Modes ---------------------------------------------------------------------
+// A mode is a curated, purpose-named bundle of workflows — a lens over the same
+// engine. The first one is the AI Architecture Workbench used for architecture
+// leadership work; future modes (profiles) can add their own bundles.
+
+export type WorkbenchMode = {
+  id: string;
+  name: string;
+  tagline: string;
+  description: string;
+  workflowIds: string[];
+};
+
+export const ARCHITECTURE_MODE: WorkbenchMode = {
+  id: 'architecture',
+  name: 'AI Architecture Workbench',
+  tagline: 'Your architecture artifact factory.',
+  description:
+    'Everything an AI architect produces on a working week: structured logs, ' +
+    'director-ready reports, decision and risk registers, ADRs, review board packets, ' +
+    'backlog breakdowns, Microsoft-stack alignment reviews, and meeting talk tracks.',
+  workflowIds: [
+    'daily-log',
+    'weekly-report',
+    'decision-extractor',
+    'risk-extractor',
+    'adr',
+    'review-board-packet',
+    'roadmap-to-backlog',
+    'microsoft-alignment',
+    'talk-track',
+    'architecture-canon',
+  ],
+};
+
+export const MODES: WorkbenchMode[] = [ARCHITECTURE_MODE];
+
+export function getMode(id: string): WorkbenchMode | null {
+  return MODES.find((m) => m.id === id) ?? null;
+}
+
+export function modeWorkflows(mode: WorkbenchMode): WorkflowDef[] {
+  return mode.workflowIds.map((id) => getWorkflow(id)).filter((w): w is WorkflowDef => !!w);
 }

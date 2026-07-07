@@ -138,6 +138,27 @@ The **Skill Lab** page is the governance surface for your skills:
   produced it) as regression baseline material.
 - **Preferred provider/model per skill** — saved and used as the Lab default.
 
+## Architecture Mode
+
+The **Architecture** page is the *AI Architecture Workbench* — a curated bundle
+of the workflows an AI architect produces in a working week:
+
+| Workflow | Output |
+|---|---|
+| Daily architecture log | structured log |
+| Weekly AI architecture report | director-ready summary |
+| Decision extractor | decisions made / needed, with owners |
+| Risk extractor | risks, blockers, ownership gaps |
+| ADR generator | formal architecture decision records |
+| Review board packet | packet for architecture/security/executive review |
+| Roadmap to backlog | epics / features / thin slices |
+| Microsoft alignment review | Foundry / Copilot / APIM / MCP / Entra alignment |
+| Talk track builder | short ready-to-say meeting language |
+| Architecture canon update | sanitized canon note |
+
+Each has a bundled example skill (frontmatter `kind:` matches it to the
+workflow); your own skills of the same kind are preferred automatically.
+
 ## Provider Shootout
 
 The **Shootout** page runs the same input through the same skill on multiple
