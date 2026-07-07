@@ -1,7 +1,7 @@
 // Server-rendered HTML UI. No frontend framework: template literals + small
 // inline scripts that call the JSON API.
 import path from 'node:path';
-import { APP_ROOT, type LoadedConfig } from './config.ts';
+import { APP_ROOT, type LoadedConfig, type Profile } from './config.ts';
 import type { PathCheck } from './paths.ts';
 import type { Skill } from './skills.ts';
 import type { ProviderHealth } from './providers/index.ts';
@@ -70,6 +70,7 @@ details summary{cursor:pointer;color:var(--accent)}
 const NAV = [
   ['/', 'Dashboard'],
   ['/brief', 'Brief'],
+  ['/profiles', 'Profiles'],
   ['/settings', 'Settings'],
   ['/skills', 'Skills'],
   ['/lab', 'Skill Lab'],
@@ -172,7 +173,13 @@ export function pageDashboard(d: {
   artifacts: ArtifactRecord[];
   skillCount: number;
   storeBackend: string;
+  activeProfile: Profile | null;
 }): string {
+  const profileBanner = d.activeProfile
+    ? `<div class="panel"><b>Profile:</b> ${esc(d.activeProfile.name)} <span class="mono small dim">(${esc(d.activeProfile.id)})</span>
+       — ${d.activeProfile.allowedWorkflows.length ? `${d.activeProfile.allowedWorkflows.length} workflow(s) allowed` : 'all workflows allowed'}.
+       <a href="/profiles">Manage profiles</a></div>`
+    : '';
   const setupBanner = d.needsSetup
     ? `<div class="panel" style="border-color:var(--warn)"><b>⚙ First-run setup:</b> no real note folders are configured yet —
        everything currently falls back to the local <span class="mono">/data</span> folder (which works fine for trying it out).
@@ -188,6 +195,7 @@ export function pageDashboard(d: {
     : '<tr><td colspan="4" class="dim">No artifacts yet.</td></tr>';
   return layout('Dashboard', '/', `
 <h1>Dashboard</h1>
+${profileBanner}
 ${setupBanner}
 <h2>Quick actions</h2>
 <div class="qa">
@@ -773,6 +781,113 @@ ${kv('Error', r.error ? `<span style="color:var(--err)">${esc(r.error)}</span>` 
 <h2>Output</h2><div class="panel"><pre>${esc(d.artifactContent || '(no artifact)')}</pre></div>
 <h2>Prompt</h2>
 <div class="panel"><details><summary>Full prompt sent to model</summary><pre>${esc(r.prompt || '(not recorded)')}</pre></details></div>`);
+}
+
+// --- Project profiles ------------------------------------------------------------
+
+export function pageProfiles(d: { profiles: Profile[]; activeProfileId: string; workflows: WorkflowDef[] }): string {
+  const rows = d.profiles.length
+    ? d.profiles
+        .map((p) => {
+          const active = p.id === d.activeProfileId;
+          return `<tr>
+<td><b>${esc(p.name)}</b> ${active ? '<span class="badge b-ok">active</span>' : ''}<br>
+<span class="mono small dim">${esc(p.id)}</span><br><span class="dim small">${esc(p.description)}</span></td>
+<td class="small dim">${p.allowedWorkflows.length ? `${p.allowedWorkflows.length} workflow(s)` : 'all workflows'}<br>
+approvals: ${p.approvalActions.length ? p.approvalActions.map(esc).join(', ') : 'none'}</td>
+<td class="mono small dim">${(['skillsDir', 'obsidianVaultDir', 'dailyLogDir', 'gitRepoDir'] as const)
+            .filter((k) => p[k])
+            .map((k) => `${k}: ${esc(p[k])}`)
+            .join('<br>') || '(inherits base paths)'}</td>
+<td><div class="actions" style="margin:0">
+${active
+            ? `<button class="secondary" onclick="activate('')">Deactivate</button>`
+            : `<button onclick="activate('${esc(p.id)}')">Activate</button>`}
+<button class="secondary" onclick='editProfile(${JSON.stringify(p).replaceAll("'", '&#39;')})'>Edit</button>
+<button class="secondary" onclick="delProfile('${esc(p.id)}')">Delete</button>
+</div></td></tr>`;
+        })
+        .join('')
+    : '<tr><td colspan="4" class="dim">No profiles yet — seed the examples or create one below.</td></tr>';
+
+  const wfChecks = d.workflows
+    .map(
+      (w) => `<label style="display:inline-block;margin:2px 14px 2px 0;font-weight:400">
+<input type="checkbox" class="wfChk" value="${esc(w.id)}"> ${esc(w.name)}</label>`,
+    )
+    .join('');
+  const pathField = (key: string, label: string) => `
+<label for="pf-${key}">${esc(label)} <span class="dim">(blank = inherit base config)</span></label>
+<input type="text" id="pf-${key}" spellcheck="false">`;
+
+  return layout('Profiles', '/profiles', `
+<h1>Project Profiles</h1>
+<p class="dim">A profile bundles machine-local paths, a default provider, allowed workflows, and allowed approval
+actions under a name — Work Notes, AI Architecture, Book, … Profiles live in
+<span class="mono">local-config.json</span> (gitignored), so each machine keeps its own paths while the repo stays
+portable. The active profile overrides Settings values wherever it sets one.</p>
+<div id="pfMsg" class="msg"></div>
+<div class="actions"><button class="secondary" id="seedBtn">Seed example profiles</button></div>
+<div class="panel"><table><tr><th>Profile</th><th>Scope</th><th>Path overrides</th><th></th></tr>${rows}</table></div>
+<h2>Create / edit profile</h2>
+<div class="panel">
+<div class="row">
+  <div><label for="pf-id">Id <span class="dim">(lowercase, hyphens)</span></label><input type="text" id="pf-id" spellcheck="false"></div>
+  <div><label for="pf-name">Name</label><input type="text" id="pf-name"></div>
+</div>
+<label for="pf-description">Description</label><input type="text" id="pf-description">
+${pathField('skillsDir', 'Skills directory')}
+${pathField('obsidianVaultDir', 'Obsidian vault root')}
+${pathField('dailyLogDir', 'Daily log output folder')}
+${pathField('weeklyReportDir', 'Weekly report output folder')}
+${pathField('wikiSourceDir', 'Wiki source output folder')}
+${pathField('gitRepoDir', 'Git repo (approval-gated commits)')}
+<label for="pf-provider">Default provider <span class="dim">(blank = inherit)</span></label>
+<select id="pf-provider"><option value="">inherit</option><option value="mock">mock</option>
+<option value="claude-cli">claude-cli</option><option value="copilot-cli">copilot-cli</option></select>
+<label>Allowed workflows <span class="dim">(none checked = all allowed)</span></label>
+<div>${wfChecks}</div>
+<label>Allowed approval actions</label>
+<div>
+<label style="display:inline-block;margin-right:14px;font-weight:400"><input type="checkbox" class="apChk" value="obsidian-write"> obsidian-write</label>
+<label style="display:inline-block;font-weight:400"><input type="checkbox" class="apChk" value="git-commit"> git-commit</label>
+</div>
+<div class="actions"><button id="saveBtn">Save profile</button></div>
+</div>
+<script>
+async function activate(id){try{await api('/api/profiles/activate',{method:'POST',body:JSON.stringify({id})});
+msg('pfMsg',id?('Activated '+id+' — reloading…'):'Deactivated — using base config. Reloading…',true);
+setTimeout(()=>location.reload(),600)}catch(e){msg('pfMsg',e.message,false)}}
+async function delProfile(id){if(!confirm('Delete profile '+id+'? (Never deletes any notes/files.)'))return;
+try{await api('/api/profiles/delete',{method:'POST',body:JSON.stringify({id})});
+msg('pfMsg','Deleted — reloading…',true);setTimeout(()=>location.reload(),600)}catch(e){msg('pfMsg',e.message,false)}}
+function editProfile(p){
+for(const k of ['id','name','description','skillsDir','obsidianVaultDir','dailyLogDir','weeklyReportDir','wikiSourceDir','gitRepoDir'])
+document.getElementById('pf-'+k).value=p[k]||'';
+document.getElementById('pf-provider').value=p.defaultProvider||'';
+document.querySelectorAll('.wfChk').forEach(c=>{c.checked=(p.allowedWorkflows||[]).includes(c.value)});
+document.querySelectorAll('.apChk').forEach(c=>{c.checked=(p.approvalActions||[]).includes(c.value)});
+window.scrollTo(0,document.body.scrollHeight);msg('pfMsg','Editing '+p.id+' — change fields and Save.',true)}
+document.getElementById('seedBtn').onclick=async()=>{try{
+const r=await api('/api/profiles/seed',{method:'POST'});
+msg('pfMsg','Added '+r.added+' example profile(s) — reloading…',true);setTimeout(()=>location.reload(),700);
+}catch(e){msg('pfMsg',e.message,false)}};
+document.getElementById('saveBtn').onclick=async()=>{try{
+const body={id:document.getElementById('pf-id').value.trim(),name:document.getElementById('pf-name').value.trim(),
+description:document.getElementById('pf-description').value.trim(),
+skillsDir:document.getElementById('pf-skillsDir').value.trim(),
+obsidianVaultDir:document.getElementById('pf-obsidianVaultDir').value.trim(),
+dailyLogDir:document.getElementById('pf-dailyLogDir').value.trim(),
+weeklyReportDir:document.getElementById('pf-weeklyReportDir').value.trim(),
+wikiSourceDir:document.getElementById('pf-wikiSourceDir').value.trim(),
+gitRepoDir:document.getElementById('pf-gitRepoDir').value.trim(),
+defaultProvider:document.getElementById('pf-provider').value,
+allowedWorkflows:[...document.querySelectorAll('.wfChk:checked')].map(c=>c.value),
+approvalActions:[...document.querySelectorAll('.apChk:checked')].map(c=>c.value)};
+await api('/api/profiles',{method:'POST',body:JSON.stringify(body)});
+msg('pfMsg','Profile saved — reloading…',true);setTimeout(()=>location.reload(),700);
+}catch(e){msg('pfMsg',e.message,false)}};
+</script>`);
 }
 
 // --- Morning Brief -----------------------------------------------------------

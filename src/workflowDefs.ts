@@ -3,7 +3,7 @@
 // The original daily-log / weekly-report / wiki-source flows are now just
 // built-in templates in this registry, alongside the newer work-routine
 // templates (ADR generator, review board packet, 1:1 prep, ...).
-import type { Config } from './config.ts';
+import type { Config, LoadedConfig } from './config.ts';
 
 /** How a workflow receives its input. */
 export type InputSourceKind = 'text' | 'files' | 'text-or-files';
@@ -298,9 +298,15 @@ export function allOutputTypes(): string[] {
   return [...new Set(WORKFLOWS.map((w) => w.outputType))];
 }
 
-/** All the workflows allowed for a config (hook for future per-profile allow-lists). */
-export function allowedWorkflows(_cfg: Config): WorkflowDef[] {
-  return WORKFLOWS;
+/** Workflows the active profile may run. No active profile / empty list = all. */
+export function allowedWorkflows(cfg: Config | LoadedConfig): WorkflowDef[] {
+  const allow = (cfg as LoadedConfig).activeProfile?.allowedWorkflows ?? [];
+  if (!allow.length) return WORKFLOWS;
+  return WORKFLOWS.filter((w) => allow.includes(w.id));
+}
+
+export function isWorkflowAllowed(cfg: Config | LoadedConfig, workflowId: string): boolean {
+  return allowedWorkflows(cfg).some((w) => w.id === workflowId);
 }
 
 // --- Modes ---------------------------------------------------------------------
