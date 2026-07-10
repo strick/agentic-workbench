@@ -1,0 +1,32 @@
+# Build context hygiene — keep the image small and free of host-local state.
+
+# Dependencies (reinstalled inside the image via npm ci)
+node_modules/
+
+# Local machine state and secrets — never bake into the image
+local-config.json
+.env.local
+.env.*.local
+data/
+runs/
+artifacts/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# VCS and tooling
+.git/
+.gitattributes
+.gitignore
+npm-debug.log*
+
+# Docker's own files
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# OS noise
+.DS_Store
+Thumbs.db

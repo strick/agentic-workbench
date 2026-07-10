@@ -1,0 +1,34 @@
+# Agentic Workbench — local container stack.
+#   docker compose up --build      # start on http://localhost:3220
+#   docker compose down            # stop
+#
+# App state (SQLite metadata, fallback output folders) persists in the named
+# 'workbench-data' volume. To use your real skills/Obsidian/git folders, mount
+# them under /app/mounts and point the matching WORKBENCH_* env var at them.
+
+services:
+  workbench:
+    build: .
+    image: agentic-workbench
+    ports:
+      - "${WORKBENCH_PORT:-3220}:3220"
+    environment:
+      # Bind inside the container is handled by the image (0.0.0.0:3220).
+      WORKBENCH_DEFAULT_PROVIDER: "${WORKBENCH_DEFAULT_PROVIDER:-mock}"
+      # Uncomment after mounting the corresponding volumes below:
+      # WORKBENCH_SKILLS_DIR: /app/mounts/skills
+      # WORKBENCH_OBSIDIAN_VAULT_DIR: /app/mounts/obsidian
+      # WORKBENCH_DAILY_LOG_DIR: /app/mounts/obsidian/Daily
+      # WORKBENCH_WEEKLY_REPORT_DIR: /app/mounts/obsidian/Reports
+      # WORKBENCH_GIT_REPO_DIR: /app/mounts/repo
+    volumes:
+      - workbench-data:/app/data
+      # Host folders (read-only where the app only reads). Adjust host paths,
+      # then uncomment the matching WORKBENCH_* env vars above.
+      # - ${HOME}/.copilot/skills:/app/mounts/skills:ro
+      # - ${HOME}/Documents/Obsidian Notes/Personal/Work:/app/mounts/obsidian
+      # - ${HOME}/code/my-repo:/app/mounts/repo
+    restart: unless-stopped
+
+volumes:
+  workbench-data:

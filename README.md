@@ -37,6 +37,27 @@ Open <http://127.0.0.1:3220>. On first run everything works immediately against 
 fallback folders under `./data` using the bundled example skills and the deterministic
 **mock provider** — no AI installation required.
 
+## Run with Docker
+
+```bash
+docker compose up --build     # http://localhost:3220
+docker compose down           # stop
+```
+
+The image runs on Node 24 (native TypeScript execution + built-in `node:sqlite`) as an
+unprivileged user. App state persists in the `workbench-data` named volume, so rebuilds
+keep your metadata and fallback output. Change the published port with
+`WORKBENCH_PORT=8080 docker compose up`.
+
+To use your real skills / Obsidian vault / git repo instead of the bundled examples,
+uncomment the `volumes` mounts and matching `WORKBENCH_*` env vars in
+[`docker-compose.yml`](docker-compose.yml). Or run the image directly:
+
+```bash
+docker build -t agentic-workbench .
+docker run -p 3220:3220 -v workbench-data:/app/data agentic-workbench
+```
+
 ## Configuration
 
 Two gitignored layers (Settings-page values win):
