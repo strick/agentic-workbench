@@ -210,7 +210,7 @@ ${setupBanner}
 <h2>Providers</h2>
 <div class="panel"><table><tr><th>Provider</th><th>Health</th><th>Detail</th></tr>${providerRows(d.providers)}</table></div>
 <h2>Recent runs</h2>
-<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th>Cost</th><th>Credits</th></tr>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th title="Estimated; Copilot CLI runs report no real cost data">Cost</th><th title="Estimated; Copilot CLI runs report no real credit data">Credits</th></tr>
 ${runRows(d.runs)}</table></div>
 <h2>Latest artifacts</h2>
 <div class="panel"><table><tr><th>File</th><th>Type</th><th>Path</th><th></th></tr>${artifacts}</table></div>`);
@@ -745,7 +745,7 @@ if(cid)renderComparison(cid);
 export function pageRuns(d: { runs: RunRecord[] }): string {
   return layout('Runs', '/runs', `
 <h1>Runs</h1>
-<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th>Cost</th><th>Credits</th></tr>
+<div class="panel"><table><tr><th>Run</th><th>Type</th><th>Skill</th><th>Provider</th><th>Model</th><th>Status</th><th>Created</th><th title="Estimated; Copilot CLI runs report no real cost data">Cost</th><th title="Estimated; Copilot CLI runs report no real credit data">Credits</th></tr>
 ${runRows(d.runs)}</table></div>`);
 }
 
@@ -770,6 +770,7 @@ ${kv('Tokens (input)', r.tokens_input ? String(r.tokens_input) : '<span class="d
 ${kv('Tokens (output)', r.tokens_output ? String(r.tokens_output) : '<span class="dim">n/a</span>')}
 ${kv('Estimated cost', r.cost_usd ? `$${r.cost_usd.toFixed(4)}` : '<span class="dim">n/a</span>')}
 ${kv('Credits used', r.credits_used ? r.credits_used.toFixed(2) : '<span class="dim">n/a</span>')}
+${r.provider_id === 'copilot-cli' && (r.cost_usd || r.credits_used) ? kv('', '<span class="dim">Estimated from token-length heuristics — Copilot CLI reports no real token/cost data. Likely runs UNDER GitHub\'s actual billed AI credits, especially for multi-turn/tool-using or file-editing skills (hidden system/skills context, MCP tool schemas, and tool-call/file-read payloads on later turns aren\'t counted). See your GitHub Copilot usage dashboard for the authoritative figure.</span>', false) : ''}
 ${kv('Input source', esc(r.input_source))}
 ${kv('Input files', r.input_files.length ? r.input_files.map(esc).join('<br>') : '<span class="dim">none</span>')}
 ${kv('Output artifact', r.output_artifact_path ? esc(r.output_artifact_path) : '<span class="dim">none</span>')}

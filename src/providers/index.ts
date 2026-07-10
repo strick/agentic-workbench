@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
-import { resolveConfigPath, type Config, type ProviderId } from '../config.ts';
+import { APP_ROOT, resolveConfigPath, type Config, type ProviderId } from '../config.ts';
 import type { Skill } from '../skills.ts';
 import type { Store } from '../store.ts';
 import { genDailyLog, genGeneric, genWeeklyReport, genWikiSource } from '../generate.ts';
@@ -11,6 +11,43 @@ export type ArtifactType = string;
 
 /** GitHub Copilot "premium request" credit price: $100 buys 10,000 credits. */
 const USD_PER_CREDIT = 0.01;
+
+/**
+ * Debug-only: persists the FULL, unfiltered raw stdout of every CLI provider
+ * run to disk (bounded to the last N files per provider). This exists
+ * because our cost/token estimator only recognizes a fixed allow-list of
+ * JSONL event types (see CopilotCliProvider.parseOutput) — any event type it
+ * doesn't recognize (e.g. tool-call/tool-result events on multi-turn/agentic
+ * runs) is silently invisible to both the estimator AND the live-run pane.
+ * Without this capture, diagnosing "what event types are we missing" would
+ * require spending fresh real credits on every investigation. Files land
+ * under data/diagnostic-run/ (gitignored) — safe to delete anytime; a write
+ * failure (e.g. read-only FS) is swallowed since this is best-effort only
+ * and must never fail a real run.
+ */
+const RAW_CAPTURE_KEEP = 5;
+function captureRawOutput(providerId: string, stdout: string): void {
+  try {
+    const dir = path.join(APP_ROOT, 'data', 'diagnostic-run');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    // Random suffix guards against two runs finishing in the same
+    // millisecond and colliding on the filename (would otherwise silently
+    // overwrite one capture instead of keeping both).
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const prefix = `raw-${providerId}-`;
+    fs.writeFileSync(path.join(dir, `${prefix}${stamp}-${suffix}.jsonl`), stdout, 'utf8');
+    const files = fs
+      .readdirSync(dir)
+      .filter((f: string) => f.startsWith(prefix))
+      .sort(); // ISO timestamps in the filename sort chronologically
+    for (const f of files.slice(0, Math.max(0, files.length - RAW_CAPTURE_KEEP))) {
+      fs.rmSync(path.join(dir, f), { force: true });
+    }
+  } catch {
+    /* best-effort diagnostics only — never fail the run because of this */
+  }
+}
 
 export type ProviderOptions = { model?: string };
 
@@ -237,6 +274,41 @@ function estimateCostUsd(model: string | undefined, tokensInput: number | undefi
  * from a provider — same heuristic MockProvider uses for its estimates. */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/** Models multi-turn agentic cost from observed turn output sizes: turn K's
+ * real input is (base prompt) + (everything from turns 1..K-1), so each
+ * extra turn resends the base prompt again plus all prior turns' generated
+ * content AND any tool results injected along the way.
+ *
+ * `generatedChars[k]` is content the MODEL produced during turn k — final
+ * message text, reasoning, and tool-call arguments — which counts as real
+ * OUTPUT tokens for that turn (and gets resent as input on every later
+ * turn). `toolResultChars[k]` is tool execution RESULT content returned
+ * during turn k (e.g. a file's contents read back) — the model didn't
+ * generate this, so it is NOT counted as output tokens, but it DOES get
+ * appended to conversation context and resent as input on later turns.
+ * Conflating the two would over-count output tokens (priced ~5x higher
+ * than input for claude-sonnet-5), so they're tracked separately.
+ *
+ * For a single turn with no tool results this reduces to exactly
+ * `{ tokensInput: basePromptTokens, tokensOutput: that turn's generated tokens }`. */
+function estimateMultiTurnTokens(
+  basePromptTokens: number,
+  generatedChars: number[],
+  toolResultChars: number[] = [],
+): { tokensInput: number; tokensOutput: number } {
+  let cumulativeInput = 0;
+  let priorContext = 0;
+  let totalOutput = 0;
+  for (let i = 0; i < generatedChars.length; i++) {
+    const genTokens = Math.ceil(generatedChars[i] / 4);
+    const toolTokens = Math.ceil((toolResultChars[i] ?? 0) / 4);
+    cumulativeInput += basePromptTokens + priorContext;
+    priorContext += genTokens + toolTokens;
+    totalOutput += genTokens;
+  }
+  return { tokensInput: cumulativeInput, tokensOutput: totalOutput };
 }
 
 function stripAnsi(s: string): string {
@@ -473,6 +545,7 @@ abstract class CliProviderBase implements AgentProvider {
     if ('error' in inv) return { ok: false, error: inv.error };
 
     const res = await execInvocation(inv, req.onChunk ? this.makeLiveLineHandler(req.onChunk, req) : undefined);
+    captureRawOutput(this.id, res.stdout);
     const stderrTail = stripAnsi(res.stderr).trim().slice(-800);
     if (res.timedOut) {
       return { ok: false, error: `${this.name} timed out after ${CLI_TIMEOUT_MS / 1000}s.`, commandLine: inv.display };
@@ -645,18 +718,62 @@ export class CopilotCliProvider extends CliProviderBase {
   }
 
   // Copilot CLI's `--output-format=json` emits JSONL — one event object per
-  // line, shaped like `{ type, data, ... }` (confirmed from a real run):
-  //   - `assistant.message`      : data.content (final text), data.model, data.outputTokens
-  //   - `session.tools_updated`  : data.model (fallback if assistant.message is missing)
-  //   - `result`                 : top-level `usage.premiumRequests` — the legacy GitHub
-  //                                 Copilot "premium request" COUNT (1 per prompt sent), not
-  //                                 a token-based cost figure. Copilot CLI never reports real
-  //                                 $ cost or input tokens, so we estimate both: input tokens
-  //                                 from the composed prompt length, and $ cost from the
-  //                                 model + token counts via USD_PER_1M_TOKENS. premiumRequests
-  //                                 is kept only as a last-resort fallback if the model is
-  //                                 unrecognized (no pricing data available).
-  // Older/unknown CLI versions may not emit any of these — this function
+  // line, shaped like `{ type, data, ... }`.
+  //
+  // CONFIRMED from real, live runs (2026-07-10):
+  //   - `assistant.message` : data.content (turn's text), data.model. NO
+  //                           data.outputTokens / data.inputTokens field was
+  //                           ever present — the CLI does not report
+  //                           per-turn token counts (contrary to earlier
+  //                           assumption). Extraction of those fields is
+  //                           kept only in case a future CLI version adds
+  //                           them.
+  //   - `assistant.turn_start` : fires once per model turn. A simple
+  //                              daily-log run showed exactly one; a
+  //                              log-work-note run (which reads/edits an
+  //                              existing file) showed TWO — i.e. the CLI
+  //                              made a tool call (e.g. reading the current
+  //                              weekly log) before writing the final
+  //                              answer. Agentic/tool-using skills are
+  //                              multi-turn, not single-shot.
+  //   - `session.tools_updated` : data.model (fallback if assistant.message is missing)
+  //   - `result` (last line)   : top-level `usage` object contains ONLY
+  //                              `premiumRequests` (legacy GitHub Copilot
+  //                              "premium request" COUNT, 1 per prompt sent —
+  //                              NOT a token-based cost figure), plus timing
+  //                              and codeChanges fields. No cost, no input
+  //                              tokens, no output tokens are ever reported.
+  //
+  // Because NEITHER input nor output tokens are ever reported, both must be
+  // estimated locally — and because runs are often multi-turn, a naive
+  // "one prompt in, one response out" estimate massively under-counts: in a
+  // real agentic loop, turn 2+ RESENDS the base prompt plus everything from
+  // prior turns, so cost grows roughly with turnCount, not just once. See
+  // the turn-aware modeling below (turnOutputChars / perTurnOutputTokens)
+  // for how input/output are approximated across all observed turns, then
+  // $ cost is derived from the model + those token counts via
+  // USD_PER_1M_TOKENS. premiumRequests is kept only as a last-resort
+  // fallback if the model is unrecognized (no pricing data available).
+  //
+  // KNOWN RESIDUAL UNDER-COUNT: even the turn-aware model above is a floor,
+  // not an exact figure, because two things the CLI sends to the real model
+  // are completely invisible to us and cannot be estimated at all:
+  //   1. Hidden system context: the full list of the user's personal
+  //      Copilot skills (`session.skills_loaded`, names + full descriptions)
+  //      and MCP server tool schemas — sent on every turn, billed by GitHub,
+  //      never appears in composePrompt(req).
+  //   2. Tool call arguments AND tool call results — e.g. the actual
+  //      contents of a file the CLI reads back mid-run (this is likely the
+  //      single largest unseen cost driver for file-editing skills like
+  //      log-work-note, since a growing weekly log file gets fully resent
+  //      as context on every subsequent turn). We only see turn boundaries
+  //      and each turn's final visible text, never the tool payloads.
+  // Estimates here will therefore typically still run BELOW GitHub's real
+  // billed AI credits, especially for multi-turn/file-touching skills;
+  // treat them as a floor, not an exact figure. See GitHub's Copilot usage
+  // dashboard for ground truth.
+  //
+  // Older/unknown CLI versions may use different shapes — this function
   // scans defensively and falls back to raw stdout text if nothing matches.
   protected parseOutput(stdout: string, req: RunRequest, model: string): { output: string; usage?: UsageInfo } {
     const lines = stdout
@@ -681,16 +798,69 @@ export class CopilotCliProvider extends CliProviderBase {
     let costUsd: number | undefined;
     let credits: number | undefined;
     let legacyPremiumRequests: number | undefined;
+    // Multi-turn/tool-use tracking (CONFIRMED 2026-07-10 via real runs, most
+    // recently 57cba267's raw capture): `assistant.turn_start` fires once
+    // per model turn, and a tool-using run's turns also emit
+    // `assistant.reasoning` (full reasoning text), `tool.execution_start`
+    // (data.arguments — the tool call's full input object) and
+    // `tool.execution_complete` (data.result.content/detailedContent — the
+    // tool's actual output, e.g. a file's contents read back). All of this
+    // was previously invisible (silently dropped by the fixed event
+    // allow-list), and is the dominant source of under-estimation for
+    // agentic, file-touching skills. `turnGeneratedChars` holds one entry
+    // per observed turn — chars of that turn's MODEL-GENERATED content
+    // (reasoning + tool-call args + final message), billed as output.
+    // `turnToolResultChars` holds tool execution RESULT content per turn —
+    // not model output, but still resent as input on later turns. See
+    // estimateMultiTurnTokens for how the two combine.
+    let turnCount = 0;
+    const turnGeneratedChars: number[] = [];
+    const turnToolResultChars: number[] = [];
 
     for (const obj of objects) {
       const type = toNonEmptyString(obj.type);
       const data = (obj.data ?? {}) as Record<string, unknown>;
 
-      if (type === 'assistant.message') {
-        resultText = toNonEmptyString(data.content) ?? resultText;
+      if (type === 'assistant.turn_start') {
+        turnCount++;
+        turnGeneratedChars.push(0);
+        turnToolResultChars.push(0);
+      } else if (type === 'assistant.reasoning') {
+        const content = toNonEmptyString(data.content);
+        if (content) {
+          if (turnGeneratedChars.length) turnGeneratedChars[turnGeneratedChars.length - 1] += content.length;
+          else turnGeneratedChars.push(content.length);
+        }
+      } else if (type === 'tool.execution_start') {
+        const args = data.arguments;
+        if (args && typeof args === 'object') {
+          const len = JSON.stringify(args).length;
+          if (turnGeneratedChars.length) turnGeneratedChars[turnGeneratedChars.length - 1] += len;
+          else turnGeneratedChars.push(len);
+        }
+      } else if (type === 'tool.execution_complete') {
+        const result = (data.result ?? {}) as Record<string, unknown>;
+        const content = toNonEmptyString(result.detailedContent) ?? toNonEmptyString(result.content);
+        if (content) {
+          if (turnToolResultChars.length) turnToolResultChars[turnToolResultChars.length - 1] += content.length;
+          else turnToolResultChars.push(content.length);
+        }
+      } else if (type === 'assistant.message') {
+        const content = toNonEmptyString(data.content);
+        if (content) {
+          resultText = content;
+          if (turnGeneratedChars.length) turnGeneratedChars[turnGeneratedChars.length - 1] += content.length;
+          else turnGeneratedChars.push(content.length); // older CLI build with no turn_start events
+        }
         usedModel = toNonEmptyString(data.model) ?? usedModel;
-        tokensOutput = toFiniteNumber(data.outputTokens) ?? tokensOutput;
-        tokensInput = toFiniteNumber(data.inputTokens) ?? tokensInput;
+        // Accumulate (not overwrite) in case a future CLI version starts
+        // reporting per-turn token counts across multiple assistant.message
+        // events — a multi-turn/tool-using run sends several turns, and
+        // overwriting would silently keep only the last turn's tokens.
+        const turnOutputTokens = toFiniteNumber(data.outputTokens);
+        if (turnOutputTokens !== undefined) tokensOutput = (tokensOutput ?? 0) + turnOutputTokens;
+        const turnInputTokens = toFiniteNumber(data.inputTokens);
+        if (turnInputTokens !== undefined) tokensInput = (tokensInput ?? 0) + turnInputTokens;
       } else if (type === 'session.tools_updated') {
         usedModel = toNonEmptyString(data.model) ?? usedModel;
       } else if (type === 'result') {
@@ -721,10 +891,20 @@ export class CopilotCliProvider extends CliProviderBase {
     }
 
     const finalModel = usedModel ?? (model || undefined);
-    // Copilot CLI doesn't report input tokens — estimate from the composed
-    // prompt (same chars/4 heuristic MockProvider uses) so cost isn't just
-    // output-only.
-    if (tokensInput === undefined) tokensInput = estimateTokens(composePrompt(req));
+    // FIX (2026-07-10, revised): both input and output token estimates now
+    // model MULTIPLE turns, not just one prompt/response pair. Evidence: a
+    // real log-work-note run showed `assistant.turn_start` fire twice
+    // (the CLI read the existing log file via a tool call before writing
+    // the final entry). See estimateMultiTurnTokens for the model. For a
+    // single-turn run this reduces exactly to the old estimate
+    // (basePromptTokens in, that one turn's text out) — no regression there.
+    const basePromptTokens = estimateTokens(composePrompt(req));
+    const effectiveGeneratedChars = turnGeneratedChars.length ? turnGeneratedChars : [(resultText || stdout).length];
+    const effectiveToolResultChars =
+      turnToolResultChars.length === effectiveGeneratedChars.length ? turnToolResultChars : effectiveGeneratedChars.map(() => 0);
+    const multiTurn = estimateMultiTurnTokens(basePromptTokens, effectiveGeneratedChars, effectiveToolResultChars);
+    if (tokensInput === undefined) tokensInput = multiTurn.tokensInput;
+    if (tokensOutput === undefined) tokensOutput = multiTurn.tokensOutput;
 
     // Prefer a real cost estimate derived from model + token counts. Only if
     // the model is unrecognized (no pricing data) do we fall back to the
@@ -753,7 +933,8 @@ export class CopilotCliProvider extends CliProviderBase {
   protected makeLiveLineHandler(onChunk: (line: string) => void, req: RunRequest): (rawLine: string, isStdout: boolean) => void {
     const acc = new TextAccumulator(onChunk);
     let liveModel: string | undefined;
-    let liveTokensOutput: number | undefined;
+    const liveGeneratedChars: number[] = [];
+    const liveToolResultChars: number[] = [];
     return (rawLine, isStdout) => {
       if (!isStdout) return onChunk(`[stderr] ${rawLine}`);
       let obj: Record<string, unknown>;
@@ -785,24 +966,65 @@ export class CopilotCliProvider extends CliProviderBase {
           return;
         }
         case 'assistant.turn_start':
+          liveGeneratedChars.push(0);
+          liveToolResultChars.push(0);
           onChunk('» generating...');
           return;
         case 'assistant.message_delta':
           acc.add(toRawString(data.deltaContent));
           return;
-        case 'assistant.message':
-          liveModel = toNonEmptyString(data.model) ?? liveModel;
-          liveTokensOutput = toFiniteNumber(data.outputTokens) ?? liveTokensOutput;
+        case 'assistant.reasoning': {
+          const content = toNonEmptyString(data.content);
+          if (content) {
+            if (liveGeneratedChars.length) liveGeneratedChars[liveGeneratedChars.length - 1] += content.length;
+            else liveGeneratedChars.push(content.length);
+          }
           return;
+        }
+        case 'tool.execution_start': {
+          const toolName = toNonEmptyString(data.toolName);
+          const args = data.arguments;
+          if (args && typeof args === 'object') {
+            const len = JSON.stringify(args).length;
+            if (liveGeneratedChars.length) liveGeneratedChars[liveGeneratedChars.length - 1] += len;
+            else liveGeneratedChars.push(len);
+          }
+          if (toolName) onChunk(`» tool: ${toolName}`);
+          return;
+        }
+        case 'tool.execution_complete': {
+          const result = (data.result ?? {}) as Record<string, unknown>;
+          const content = toNonEmptyString(result.detailedContent) ?? toNonEmptyString(result.content);
+          if (content) {
+            if (liveToolResultChars.length) liveToolResultChars[liveToolResultChars.length - 1] += content.length;
+            else liveToolResultChars.push(content.length);
+          }
+          return;
+        }
+        case 'assistant.message': {
+          liveModel = toNonEmptyString(data.model) ?? liveModel;
+          const content = toNonEmptyString(data.content);
+          if (content) {
+            if (liveGeneratedChars.length) liveGeneratedChars[liveGeneratedChars.length - 1] += content.length;
+            else liveGeneratedChars.push(content.length);
+          }
+          return;
+        }
         case 'assistant.turn_end':
           acc.flush();
           return;
         case 'result': {
           const usageObj = (obj.usage ?? data.usage ?? {}) as Record<string, unknown>;
+          const basePromptTokens = estimateTokens(composePrompt(req));
+          const multiTurn = estimateMultiTurnTokens(
+            basePromptTokens,
+            liveGeneratedChars.length ? liveGeneratedChars : [0],
+            liveToolResultChars,
+          );
           const costUsd =
             toFiniteNumber(usageObj.cost) ??
             toFiniteNumber(usageObj.total_cost_usd) ??
-            estimateCostUsd(liveModel ?? req.options?.model, estimateTokens(composePrompt(req)), liveTokensOutput);
+            estimateCostUsd(liveModel ?? req.options?.model, multiTurn.tokensInput, multiTurn.tokensOutput);
           const credits = costUsd !== undefined ? costUsd / USD_PER_CREDIT : toFiniteNumber(usageObj.premiumRequests);
           onChunk(credits !== undefined ? `» done (~${credits.toFixed(2)} credit${credits === 1 ? '' : 's'} used)` : '» done.');
           return;
