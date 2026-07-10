@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { APP_ROOT, resolveConfigPath, type Config, type ProviderId } from '../config.ts';
+import { allowedReadRoots, allowedWriteRoots } from '../paths.ts';
 import type { Skill } from '../skills.ts';
 import type { Store } from '../store.ts';
 import { genDailyLog, genGeneric, genWeeklyReport, genWikiSource } from '../generate.ts';
@@ -11,6 +12,25 @@ export type ArtifactType = string;
 
 /** GitHub Copilot "premium request" credit price: $100 buys 10,000 credits. */
 const USD_PER_CREDIT = 0.01;
+
+/**
+ * Tokens of context the Copilot CLI sends to the model on EVERY turn but never
+ * emits in its JSON output: the agent/system prompt plus the JSON schema of
+ * every available tool — the builtin tools (powershell, view, str_replace,
+ * create, …) and the whole github-mcp-server default toolset. `session.*`
+ * events only report the SKILLS list (which we measure separately) and the
+ * model name — never the tool schemas — so this context is invisible to any
+ * local estimator yet is billed on each turn. This constant approximates it.
+ *
+ * Calibrated against real captures + observed billing: a 5-turn log-work-note
+ * run measures ~27.6k estimated input + 1874 real output tokens → ~7.4 credits
+ * WITHOUT this term; the user's actual GitHub usage for that class of run is
+ * ~12+. ~5k tokens/turn of unseen tool-schema + system context closes that gap
+ * (5 turns → ~12.4 credits) and is physically plausible: a dozen-plus tool
+ * schemas at a few hundred tokens each, plus agent instructions. Tune here if
+ * your real dashboard numbers differ.
+ */
+const HIDDEN_TOOL_SCHEMA_TOKENS_PER_TURN = 5000;
 
 /**
  * Debug-only: persists the FULL, unfiltered raw stdout of every CLI provider
@@ -707,53 +727,96 @@ export class CopilotCliProvider extends CliProviderBase {
   name = 'GitHub Copilot CLI';
   defaultCommand = 'copilot';
 
+  /** Filesystem roots the CLI is allowed to touch (scoped via --add-dir). */
+  private allowDirs: string[];
+
+  constructor(configuredPath: string, allowDirs: string[] = []) {
+    super(configuredPath);
+    this.allowDirs = allowDirs;
+  }
+
   // copilot -p/--prompt <text> is its non-interactive mode; it has no stdin
   // prompt equivalent, so oversized/shim cases return null (clear error).
-  // No --allow-* flags are passed: Copilot cannot edit files or run commands.
+  //
+  // TOOL PERMISSIONS (why the flags below matter): the modern Copilot CLI is
+  // agentic — it reads/edits files and runs commands, gated behind approval
+  // prompts. In -p/non-interactive mode those prompts CANNOT be answered
+  // (there is no TTY and the workbench doesn't surface them), and the CLI's
+  // own help states `--allow-all-tools` is "required for non-interactive
+  // mode." Without it, the first tool call the model attempts is denied and
+  // the agentic loop can end early, making the run do less work than a real
+  // interactive one.
+  //
+  //   --allow-all-tools : auto-approve tool calls (no stalls, no prompts).
+  //                       Real captures show these skills genuinely need the
+  //                       `powershell` tool — log-work-note runs PowerShell to
+  //                       compute the week and read/append the weekly log — so
+  //                       shell is intentionally NOT denied; blocking it breaks
+  //                       the skills. (Toggle discussed with the user: allow
+  //                       shell, scope the filesystem instead.)
+  //   --add-dir <root>  : with no --allow-all-paths, the built-in file tools
+  //                       are confined to these roots — exactly the read/write
+  //                       roots the app already considers legitimate
+  //                       (allowedReadRoots / allowedWriteRoots). We also pass
+  //                       no --allow-all-urls, so web access stays gated.
+  //                       (Note: shell commands themselves are not path- or
+  //                       network-constrained by --add-dir — that is inherent
+  //                       to running PowerShell-driven skills.)
+  //
   // --output-format=json emits JSONL (one JSON object per line) carrying the
-  // final response plus usage/cost metadata (see parseOutput below).
+  // response plus turn/tool events used for cost/credit estimation (see
+  // parseOutput below).
   protected buildArgs(inlinePrompt: string | null, model: string): string[] | null {
     if (inlinePrompt === null) return null;
-    return ['-p', inlinePrompt, '--output-format=json', ...(model ? ['--model', model] : [])];
+    return [
+      '-p',
+      inlinePrompt,
+      '--output-format=json',
+      '--allow-all-tools',
+      ...this.allowDirs.flatMap((d) => ['--add-dir', d]),
+      ...(model ? ['--model', model] : []),
+    ];
   }
 
   // Copilot CLI's `--output-format=json` emits JSONL — one event object per
   // line, shaped like `{ type, data, ... }`.
   //
-  // CONFIRMED from real, live runs (2026-07-10):
-  //   - `assistant.message` : data.content (turn's text), data.model. NO
-  //                           data.outputTokens / data.inputTokens field was
-  //                           ever present — the CLI does not report
-  //                           per-turn token counts (contrary to earlier
-  //                           assumption). Extraction of those fields is
-  //                           kept only in case a future CLI version adds
-  //                           them.
+  // CONFIRMED from real, live runs (2026-07-10, incl. raw captures):
+  //   - `assistant.message` : data.content (turn's text), data.model, AND
+  //                           data.outputTokens — the CLI DOES report real
+  //                           per-turn OUTPUT tokens here (e.g. 700 for a
+  //                           1-turn daily-log; 1874 summed across a 5-turn
+  //                           log-work-note run). We accumulate these as the
+  //                           authoritative output count. data.inputTokens is
+  //                           NOT present, so INPUT must still be estimated.
   //   - `assistant.turn_start` : fires once per model turn. A simple
   //                              daily-log run showed exactly one; a
-  //                              log-work-note run (which reads/edits an
-  //                              existing file) showed TWO — i.e. the CLI
-  //                              made a tool call (e.g. reading the current
-  //                              weekly log) before writing the final
-  //                              answer. Agentic/tool-using skills are
-  //                              multi-turn, not single-shot.
+  //                              log-work-note run that runs PowerShell to
+  //                              compute the week and read/append the weekly
+  //                              log showed FIVE. Agentic/tool-using skills
+  //                              are multi-turn, not single-shot.
   //   - `session.tools_updated` : data.model (fallback if assistant.message is missing)
   //   - `result` (last line)   : top-level `usage` object contains ONLY
   //                              `premiumRequests` (legacy GitHub Copilot
-  //                              "premium request" COUNT, 1 per prompt sent —
-  //                              NOT a token-based cost figure), plus timing
-  //                              and codeChanges fields. No cost, no input
-  //                              tokens, no output tokens are ever reported.
+  //                              "premium request" COUNT — confirmed ALWAYS 1
+  //                              even for a 5-turn agentic run, so it is NOT a
+  //                              usable cost/credit figure), plus timing and
+  //                              codeChanges fields. No cost and no INPUT
+  //                              tokens are ever reported here.
   //
-  // Because NEITHER input nor output tokens are ever reported, both must be
-  // estimated locally — and because runs are often multi-turn, a naive
+  // So OUTPUT tokens come from assistant.message (real), but INPUT tokens must
+  // be estimated locally — and because runs are often multi-turn, a naive
   // "one prompt in, one response out" estimate massively under-counts: in a
   // real agentic loop, turn 2+ RESENDS the base prompt plus everything from
-  // prior turns, so cost grows roughly with turnCount, not just once. See
-  // the turn-aware modeling below (turnOutputChars / perTurnOutputTokens)
-  // for how input/output are approximated across all observed turns, then
-  // $ cost is derived from the model + those token counts via
-  // USD_PER_1M_TOKENS. premiumRequests is kept only as a last-resort
-  // fallback if the model is unrecognized (no pricing data available).
+  // prior turns, so input grows roughly with turnCount, not just once. See
+  // the turn-aware modeling below (estimateMultiTurnTokens) for how input is
+  // approximated across all observed turns, then $ cost is derived from the
+  // model + token counts via USD_PER_1M_TOKENS. premiumRequests is kept only
+  // as a last-resort fallback if the model is unrecognized (no pricing data).
+  //
+  // GitHub's real billed credits are NOT derivable from this output; the
+  // figure here is a modeled approximation (shipped as an explicit floor,
+  // per product decision) — see the app's cost column tooltip.
   //
   // KNOWN RESIDUAL UNDER-COUNT: even the turn-aware model above is a floor,
   // not an exact figure, because two things the CLI sends to the real model
@@ -816,10 +879,23 @@ export class CopilotCliProvider extends CliProviderBase {
     let turnCount = 0;
     const turnGeneratedChars: number[] = [];
     const turnToolResultChars: number[] = [];
+    // Hidden per-turn context: the CLI loads the user's full skills list and
+    // MCP/tool schemas once (as `session.*` events) but RESENDS them to the
+    // model on every turn, and GitHub bills them every turn. They never appear
+    // in composePrompt(req), so they were previously uncounted — a documented
+    // source of under-estimation. We measure the serialized size of each
+    // distinct session-context event (latest wins, so repeated
+    // `session.tools_updated` updates don't double-count) and charge it once
+    // per turn below. Absent such events, this contributes nothing.
+    const sessionContextChars: Record<string, number> = {};
 
     for (const obj of objects) {
       const type = toNonEmptyString(obj.type);
       const data = (obj.data ?? {}) as Record<string, unknown>;
+
+      if (type && type.startsWith('session.')) {
+        sessionContextChars[type] = JSON.stringify(obj).length;
+      }
 
       if (type === 'assistant.turn_start') {
         turnCount++;
@@ -903,7 +979,16 @@ export class CopilotCliProvider extends CliProviderBase {
     const effectiveToolResultChars =
       turnToolResultChars.length === effectiveGeneratedChars.length ? turnToolResultChars : effectiveGeneratedChars.map(() => 0);
     const multiTurn = estimateMultiTurnTokens(basePromptTokens, effectiveGeneratedChars, effectiveToolResultChars);
-    if (tokensInput === undefined) tokensInput = multiTurn.tokensInput;
+    // Charge the hidden context resent to the model once per modeled turn:
+    //   1. the MEASURED skills list + session metadata (sessionContextChars),
+    //   2. the UNSEEN tool schemas + agent/system prompt, which never appear
+    //      in the stream, approximated by HIDDEN_TOOL_SCHEMA_TOKENS_PER_TURN.
+    // Both are billed every turn, so they scale with turn count — the main
+    // reason a naive per-turn estimate under-counts agentic, tool-heavy runs.
+    const turns = effectiveGeneratedChars.length;
+    const measuredHiddenPerTurn = Math.ceil(Object.values(sessionContextChars).reduce((a, b) => a + b, 0) / 4);
+    const hiddenContextInput = (measuredHiddenPerTurn + HIDDEN_TOOL_SCHEMA_TOKENS_PER_TURN) * turns;
+    if (tokensInput === undefined) tokensInput = multiTurn.tokensInput + hiddenContextInput;
     if (tokensOutput === undefined) tokensOutput = multiTurn.tokensOutput;
 
     // Prefer a real cost estimate derived from model + token counts. Only if
@@ -1037,10 +1122,20 @@ export class CopilotCliProvider extends CliProviderBase {
 }
 
 export function getProviders(cfg: Config): Record<ProviderId, AgentProvider> {
+  // Scope Copilot's filesystem access to exactly the roots the app already
+  // trusts to read from / write to — deduped, and only those that exist so we
+  // never hand the CLI a bogus --add-dir.
+  const copilotDirs = [...new Set([...allowedReadRoots(cfg), ...allowedWriteRoots(cfg)])].filter((d) => {
+    try {
+      return d && fs.statSync(d).isDirectory();
+    } catch {
+      return false;
+    }
+  });
   return {
     mock: new MockProvider(),
     'claude-cli': new ClaudeCliProvider(cfg.claudeCliPath),
-    'copilot-cli': new CopilotCliProvider(cfg.copilotCliPath),
+    'copilot-cli': new CopilotCliProvider(cfg.copilotCliPath, copilotDirs),
   };
 }
 

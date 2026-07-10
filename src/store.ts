@@ -33,7 +33,7 @@ export type RunRecord = {
   tokens_input: number;
   tokens_output: number;
   cost_usd: number; // real cost reported by the CLI, 0 if unknown/not applicable
-  credits_used: number; // GitHub Copilot premium-request credits ($0.10/credit), 0 if unknown/not applicable
+  credits_used: number; // GitHub Copilot AI credits; USD conversion uses USD_PER_CREDIT in providers/index.ts. 0 if unknown/not applicable
   prompt: string; // full composed prompt (skill markdown + input block) sent to the provider
   comparison_id: string; // groups runs launched together for provider comparison ('' if standalone)
 };
